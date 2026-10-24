@@ -34,6 +34,7 @@ static void               nvAccelGpuVaFree(IOAccelMemoryMap *map);
 static bool               nvAccelFlipTo(IOAccelResource2 *res);
 static bool               nvAccelCopyToScanout(IOAccelResource2 *res);
 void                      nvAccelSwapProbe(IOAccelResource2 *a1, IOAccelResource2 *a2);
+void                      nvAccelVmUnmappedTouch(int what);
 bool                      nvAccelResHasContent(IOAccelResource2 *res);
 static void               nvAccelWriteStamp(int index, unsigned int value);
 #ifdef NMX_ACCEL
@@ -707,6 +708,8 @@ public:
             // accelerator that does not wait, that mark would let a CPU lock or a copied present read a surface before
             // its pixels landed, so the plugin keeps marking them after the GPU finishes.
             setProperty("NVAccelSurfaceWait", 1ULL, 32);
+            // WindowServer's reads of shared surface VRAM can be marked, and application writes wait for them (nvSurfReadWait)
+            setProperty("NVAccelSurfaceReadMarks", 1ULL, 32);
             registerService(); ALOG("registerService() called — Metal can now find MetalPluginName=%s", "NVMTLDriver");
             gAccel = this; gEnableAccel = &NVAccel::enableFromHook;
             for (unsigned i = 0; i < NV_CARRIERS; i++) {
@@ -908,10 +911,12 @@ static NVVidMemory *nvres_vidmem(IOAccelResource2 *r)
 bool NVResource::addToAperture()
 {
     NVVidMemory *m = nvres_vidmem(this);
+    if (m && m->fUnmapped) nvAccelVmUnmappedTouch(1);
     if (fApLogged < 4) { fApLogged++;
         ALOG("NVResource::addToAperture -> true (vidmem %p phys 0x%llx %llu bytes, already in BAR1)",
              m, m ? m->fPhys : 0ull, m ? m->fBytes : 0ull); }
-    return m && m->fPhys && m->fBytes;
+    // unmapped VRAM is as reachable by the GPU as mapped VRAM; only a CPU mapping (getApertureMemoryDescriptor) is missing
+    return m && (m->fPhys || (m->fUnmapped && m->fRmHandle)) && m->fBytes;
 }
 
 void NVResource::removeFromAperture() { }
@@ -927,6 +932,7 @@ void *NVResource::getApertureMemoryDescriptor(unsigned long long *a0)
     }
     if (fApDesc) return fApDesc;
     NVVidMemory *m = nvres_vidmem(this);
+    if (m && m->fUnmapped) nvAccelVmUnmappedTouch(2);
     if (!m || !m->fPhys || !m->fBytes) {
         if (fApLogged < 8) { fApLogged++;
             ALOG("NVResource::getApertureMemoryDescriptor: no BAR1-backed vidmem at +0x88 (mem %p)", m); }
@@ -954,6 +960,11 @@ void NVResource::free()
 
 // 1 = a surface keeps its VRAM across the family's deallocPhysical/allocPhysical (see deallocPhysical).
 static int gVmSticky = 1;
+// 1 = take VRAM with no BAR1 mapping when the framebuffer's BAR1 budget is spent (the framebuffer grants it only with
+// debug.nvrmfb_vram_unmapped=1). The touch counters show whether the family ever asks such memory for an address.
+static int gVmUnmappedOk = 1;
+static SInt64 gCntVmUnmapped, gCntVmUnmappedTouch[3];
+void nvAccelVmUnmappedTouch(int what) { if (what >= 0 && what < 3) OSAddAtomic64(1, &gCntVmUnmappedTouch[what]); }
 static SInt64 gCntVmParked, gCntVmUnparked, gCntVmParkReleased;
 
 bool NVVidMemory::allocPhysical()
@@ -976,7 +987,8 @@ bool NVVidMemory::allocPhysical()
     if (fParkHandle) {
         if (fParkBytes >= want) {
             fRmHandle = fParkHandle; fKva = fParkKva; fPhys = fParkPhys; fBytes = fParkBytes; fAllocationCookie = fParkCookie;
-            fParkHandle = nullptr; fParkKva = nullptr; fParkPhys = fParkBytes = fParkCookie = 0;
+            fUnmapped = fParkUnmapped;
+            fParkHandle = nullptr; fParkKva = nullptr; fParkPhys = fParkBytes = fParkCookie = 0; fParkUnmapped = false;
             *(volatile unsigned long long *)((unsigned char *)this + 0xc8) = fPhys;
             OSAddAtomic64(1, &gCntVmUnparked);
             return true;
@@ -988,8 +1000,10 @@ bool NVVidMemory::allocPhysical()
     for (unsigned i = 0; i < sizeof r; i++) ((volatile unsigned char *)&r)[i] = 0;
     r.version = NVRM_VRAM_ABI_VERSION;
     r.size    = want;
+    if (gVmUnmappedOk) r.flags = NVRM_VRAM_FLAG_UNMAPPED_OK;
     IOReturn ret = NVAccel::gAccel->askFramebufferForVram(&r, true);
-    if (ret != kIOReturnSuccess || !r.handle || !r.phys) {
+    const bool unmapped = ret == kIOReturnSuccess && r.handle && (r.flags & NVRM_VRAM_FLAG_UNMAPPED);
+    if (ret != kIOReturnSuccess || !r.handle || (!r.phys && !unmapped)) {
         OSAddAtomic64(1, &gCntVmRefused);
         ALOG("NVVidMemory::allocPhysical(%p): %llu bytes REFUSED by the framebuffer (0x%x)",
              this, want, (unsigned)ret);
@@ -1002,6 +1016,8 @@ bool NVVidMemory::allocPhysical()
         return false;
     }
     fRmHandle = r.handle; fKva = r.kva; fPhys = r.phys; fBytes = r.actualSize; fAllocationCookie = r.allocationCookie;
+    fUnmapped = unmapped;
+    if (unmapped) OSAddAtomic64(1, &gCntVmUnmapped);
     OSAddAtomic64(1, &gCntVmAlloc); OSAddAtomic64((SInt64)fBytes, &gCntVmAllocBytes);
     *(volatile unsigned long long *)((unsigned char *)this + 0xc8) = fPhys;
     ALOGV("NVVidMemory::allocPhysical(%p): %llu bytes of REAL VRAM -- phys 0x%llx kva %p [BAR1 %llu]",
@@ -1027,19 +1043,21 @@ void NVVidMemory::deallocPhysical()
     if (gVmSticky) {
         releaseParked();
         fParkHandle = fRmHandle; fParkKva = fKva; fParkPhys = fPhys; fParkBytes = fBytes; fParkCookie = fAllocationCookie;
+        fParkUnmapped = fUnmapped;
         OSAddAtomic64(1, &gCntVmParked);
     } else {
-        releaseVram(fRmHandle, fKva, fBytes, fAllocationCookie);
+        releaseVram(fRmHandle, fKva, fBytes, fAllocationCookie, fUnmapped);
     }
-    fRmHandle = nullptr; fKva = nullptr; fPhys = 0; fBytes = 0; fAllocationCookie = 0;
+    fRmHandle = nullptr; fKva = nullptr; fPhys = 0; fBytes = 0; fAllocationCookie = 0; fUnmapped = false;
     *(volatile unsigned long long *)((unsigned char *)this + 0xc8) = 0;
 }
 
-void NVVidMemory::releaseVram(void *handle, void *kva, unsigned long long bytes, unsigned long long cookie)
+void NVVidMemory::releaseVram(void *handle, void *kva, unsigned long long bytes, unsigned long long cookie, bool unmapped)
 {
     struct NVRMVramRequest r;
     for (unsigned i = 0; i < sizeof r; i++) ((volatile unsigned char *)&r)[i] = 0;
     r.version = NVRM_VRAM_ABI_VERSION;
+    if (unmapped) r.flags = NVRM_VRAM_FLAG_UNMAPPED;
     r.handle = handle; r.kva = kva; r.actualSize = bytes; r.allocationCookie = cookie;
     if (NVAccel::gAccel) NVAccel::gAccel->askFramebufferForVram(&r, false);
 }
@@ -1047,16 +1065,16 @@ void NVVidMemory::releaseVram(void *handle, void *kva, unsigned long long bytes,
 void NVVidMemory::releaseParked()
 {
     if (!fParkHandle) return;
-    releaseVram(fParkHandle, fParkKva, fParkBytes, fParkCookie);
-    fParkHandle = nullptr; fParkKva = nullptr; fParkPhys = fParkBytes = fParkCookie = 0;
+    releaseVram(fParkHandle, fParkKva, fParkBytes, fParkCookie, fParkUnmapped);
+    fParkHandle = nullptr; fParkKva = nullptr; fParkPhys = fParkBytes = fParkCookie = 0; fParkUnmapped = false;
     OSAddAtomic64(1, &gCntVmParkReleased);
 }
 
 void NVVidMemory::free()
 {
     if (fRmHandle && !fScanout) {
-        releaseVram(fRmHandle, fKva, fBytes, fAllocationCookie);
-        fRmHandle = nullptr; fKva = nullptr; fPhys = 0; fBytes = 0; fAllocationCookie = 0;
+        releaseVram(fRmHandle, fKva, fBytes, fAllocationCookie, fUnmapped);
+        fRmHandle = nullptr; fKva = nullptr; fPhys = 0; fBytes = 0; fAllocationCookie = 0; fUnmapped = false;
     }
     releaseParked();
     IOAccelVidMemory::free();
@@ -1279,6 +1297,11 @@ SYSCTL_INT(_debug, OID_AUTO, nvaccel_vm_sticky, CTLFLAG_RW | CTLFLAG_LOCKED, &gV
 NVACCEL_CNT(nvaccel_vm_parked,        gCntVmParked,       "VRAM kept when the family freed a surface's VRAM");
 NVACCEL_CNT(nvaccel_vm_unparked,      gCntVmUnparked,     "allocations answered with the surface's kept VRAM");
 NVACCEL_CNT(nvaccel_vm_park_released, gCntVmParkReleased, "kept VRAM released (resource freed or grown)");
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_vm_unmapped_ok, CTLFLAG_RW | CTLFLAG_LOCKED, &gVmUnmappedOk, 0, "1 = accept VRAM with no BAR1 mapping when the framebuffer offers it (debug.nvrmfb_vram_unmapped)");
+NVACCEL_CNT(nvaccel_vm_unmapped,      gCntVmUnmapped,     "allocations answered with VRAM that has no BAR1 mapping");
+NVACCEL_CNT(nvaccel_vm_unmapped_seg,  gCntVmUnmappedTouch[0], "getPhysicalSegment asked of unmapped VRAM (answered 0)");
+NVACCEL_CNT(nvaccel_vm_unmapped_ap,   gCntVmUnmappedTouch[1], "addToAperture asked of unmapped VRAM (answered true)");
+NVACCEL_CNT(nvaccel_vm_unmapped_apmd, gCntVmUnmappedTouch[2], "getApertureMemoryDescriptor asked of unmapped VRAM (answered NULL)");
 NVACCEL_CNT(nvaccel_res_new,          gCntResNew,         "NVResource objects created");
 NVACCEL_CNT(nvaccel_res_free,         gCntResFree,        "NVResource objects freed");
 NVACCEL_CNT(nvaccel_map_commit,       gCntMapCommit,      "GPU page-table commits (MAP_MEMORY_DMA ok)");
@@ -1401,6 +1424,71 @@ static bool nvSurfWaitReady(unsigned int id)
     }
     return ready;
 }
+/*
+ * Reads of shared surface VRAM. WindowServer composites straight from an application's IOSurface VRAM (item 7), and
+ * the application draws its next frame into that surface as soon as CoreAnimation hands it back, which can be before
+ * WindowServer's GPU has finished reading it: a sticky header drawn last over scrolled content showed that content for
+ * a frame (Claude's title bar on a fast scroll, only with unmapped VRAM on). WindowServer marks the shared surfaces a
+ * command buffer samples when it commits and clears them when its GPU has finished; an application's commit that writes
+ * one of them waits here first. Kept apart from the write marks: swaps and page-offs never wait for a read.
+ */
+static int gSurfReadOn = 1;
+static SInt64 gCntReadMarks, gCntReadWaits, gCntReadTimeouts, gCntReadAsks;
+static int gSurfReadWaitMaxUs;
+static const unsigned kSurfReadWaitMs = 50;   // a composite that has not finished in 50 ms is hung; let the writer go
+static NVSurfPending gSurfRead[64];
+static unsigned int gSurfReadSeq;
+static void nvSurfReadMark(unsigned int id, bool reading)
+{
+    IOLock *l = nvSurfLock();
+    if (!l || !id) return;
+    IOLockLock(l);
+    unsigned slot = 64, oldest = 0;
+    for (unsigned i = 0; i < 64; i++) {
+        if (gSurfRead[i].id == id) { slot = i; break; }
+        if (slot == 64 && !gSurfRead[i].id) slot = i;
+        if (gSurfRead[i].seq < gSurfRead[oldest].seq) oldest = i;
+    }
+    if (reading) {
+        if (slot == 64) slot = oldest;
+        gSurfRead[slot].id = id; gSurfRead[slot].seq = ++gSurfReadSeq;
+    } else if (slot < 64 && gSurfRead[slot].id == id) {
+        gSurfRead[slot].id = 0;
+        IOLockWakeup(l, gSurfRead, false);
+    }
+    IOLockUnlock(l);
+    OSAddAtomic64(1, &gCntReadMarks);
+}
+static void nvSurfReadWait(unsigned int id)
+{
+    IOLock *l = gSurfPendLock;
+    if (!l || !id || !gSurfReadOn) return;
+    OSAddAtomic64(1, &gCntReadAsks);
+    uint64_t start = mach_absolute_time(), deadline = 0;
+    clock_interval_to_deadline(kSurfReadWaitMs, kMillisecondScale, &deadline);
+    bool waited = false, ready = true;
+    IOLockLock(l);
+    for (;;) {
+        unsigned i = 0;
+        while (i < 64 && gSurfRead[i].id != id) i++;
+        if (i == 64) break;
+        if (mach_absolute_time() >= deadline) { gSurfRead[i].id = 0; ready = false; break; }
+        waited = true;
+        IOLockSleepDeadline(l, gSurfRead, deadline, THREAD_UNINT);
+    }
+    IOLockUnlock(l);
+    if (waited) {
+        uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
+        if ((int)(ns / 1000) > gSurfReadWaitMaxUs) gSurfReadWaitMaxUs = (int)(ns / 1000);
+        OSAddAtomic64(1, ready ? &gCntReadWaits : &gCntReadTimeouts);
+    }
+}
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_surface_read_on, CTLFLAG_RW | CTLFLAG_LOCKED, &gSurfReadOn, 0, "1 = application writes to shared surface VRAM wait for WindowServer's reads of it");
+NVACCEL_CNT(nvaccel_surface_read_marks,    gCntReadMarks,    "read/done marks from WindowServer");
+NVACCEL_CNT(nvaccel_surface_read_asks,     gCntReadAsks,     "application writes that asked whether WindowServer was reading");
+NVACCEL_CNT(nvaccel_surface_read_waits,    gCntReadWaits,    "application writes that waited for a WindowServer read to finish");
+NVACCEL_CNT(nvaccel_surface_read_timeouts, gCntReadTimeouts, "application writes whose WindowServer read did not finish within 50 ms");
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_surface_read_wait_max_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gSurfReadWaitMaxUs, 0, "longest application wait for a WindowServer read, us");
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_surface_gpu, CTLFLAG_RD | CTLFLAG_LOCKED, &gSurfGpuOn, 0, "1 = WindowServer swaps wait for GPU completion here (same value as nvaccel_surface_gpu_on)");
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_surface_gpu_on, CTLFLAG_RW | CTLFLAG_LOCKED, &gSurfGpuOn, 0, "0 = WindowServer waits for its own composites again (the plugin re-asks every second)");
 NVACCEL_CNT(nvaccel_surface_gpu_marks,    gCntSurfMarks,    "pending/ready marks from WindowServer");
@@ -1436,6 +1524,9 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_vm_sticky);
     sysctl_register_oid(&sysctl__debug_nvaccel_vm_parked);      sysctl_register_oid(&sysctl__debug_nvaccel_vm_unparked);
     sysctl_register_oid(&sysctl__debug_nvaccel_vm_park_released);
+    sysctl_register_oid(&sysctl__debug_nvaccel_vm_unmapped_ok); sysctl_register_oid(&sysctl__debug_nvaccel_vm_unmapped);
+    sysctl_register_oid(&sysctl__debug_nvaccel_vm_unmapped_seg); sysctl_register_oid(&sysctl__debug_nvaccel_vm_unmapped_ap);
+    sysctl_register_oid(&sysctl__debug_nvaccel_vm_unmapped_apmd);
     sysctl_register_oid(&sysctl__debug_nvaccel_res_new);        sysctl_register_oid(&sysctl__debug_nvaccel_res_free);
     sysctl_register_oid(&sysctl__debug_nvaccel_map_commit);     sysctl_register_oid(&sysctl__debug_nvaccel_map_release);
     sysctl_register_oid(&sysctl__debug_nvaccel_map_free);
@@ -1456,6 +1547,9 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu);    sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu_on);
     sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu_marks); sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu_waits);
     sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu_timeouts); sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu_wait_max_us);
+    sysctl_register_oid(&sysctl__debug_nvaccel_surface_read_on);    sysctl_register_oid(&sysctl__debug_nvaccel_surface_read_marks);
+    sysctl_register_oid(&sysctl__debug_nvaccel_surface_read_asks);  sysctl_register_oid(&sysctl__debug_nvaccel_surface_read_waits);
+    sysctl_register_oid(&sysctl__debug_nvaccel_surface_read_timeouts); sysctl_register_oid(&sysctl__debug_nvaccel_surface_read_wait_max_us);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_async_refused); sysctl_register_oid(&sysctl__debug_nvaccel_iop_async_drop);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_late);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h0);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h1);
@@ -1641,7 +1735,7 @@ static bool nvAccelRestoreParkedForDirty(NVResource *res, NVVidMemory *vm, unsig
     const volatile unsigned short *valid = *(unsigned short *volatile const *)(r + 0x30);
     const unsigned long long want = *(const volatile unsigned long long *)((const unsigned char *)vm + 0x40);
     if (vm->fScanout || r[0x14] != 0xc0 || (flags & 0x8000) || !valid || plane > 15 ||
-        !want || vm->fParkBytes < want || !vm->fParkPhys || !vm->fParkKva)
+        !want || vm->fParkBytes < want || (!vm->fParkUnmapped && (!vm->fParkPhys || !vm->fParkKva)))
         return true;  // Preserve the original refusal and CPU-copy fallback.
     void *const handle = vm->fParkHandle;
     void *const mapping = vm->fParkKva;
@@ -1655,12 +1749,23 @@ static bool nvAccelRestoreParkedForDirty(NVResource *res, NVVidMemory *vm, unsig
 }
 // The marks arrive through NVK's surface escape (NVRM_ESC_SURF_DIRTY with plane NVRM_SS_PLANE_GPU_MARK | pending): the
 // WindowServer sandbox denies sysctl writes. Only WindowServer's own marks are taken, so no other process can hold a swap.
+// A read wait (NVRM_SS_MARK_READ_WAIT) is any process's: it only holds the caller.
 static unsigned nvSurfGpuEscape(const struct NVRMSurfShareEsc *p)
 {
+    if (p->plane & NVRM_SS_MARK_READ_WAIT) {
+        if (!gSurfReadOn) return NVRM_SS_OFF;
+        nvSurfReadWait(p->surfaceID);
+        return 0;
+    }
     if (!gSurfGpuOn) return NVRM_SS_OFF;
     char nm[32] = { 0 };
     proc_selfname(nm, sizeof nm);
     if (strcmp(nm, "WindowServer")) return NVRM_SS_OFF;
+    if (p->plane & NVRM_SS_MARK_READ) {
+        if (!gSurfReadOn) return NVRM_SS_OFF;
+        if (p->surfaceID) nvSurfReadMark(p->surfaceID, (p->plane & 1u) != 0);
+        return 0;
+    }
     if (p->surfaceID) nvSurfMark(p->surfaceID, (p->plane & 1u) != 0);
     return 0;
 }

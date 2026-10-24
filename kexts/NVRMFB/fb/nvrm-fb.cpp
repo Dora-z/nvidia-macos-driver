@@ -261,7 +261,9 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     NvU16 fEdidMmW = 0, fEdidMmH = 0;
     bool fModeSet = false;
     unsigned fHomePure = 0;
-    IODetailedTimingInformationV2 fDT[128]; unsigned fNDT = 0;
+    // kMacTimings of fDT may hold macOS's timings (64 unless nvfbscalehz is set); the rest is for addKmsRefreshModes
+    enum { kMacTimings = 224 };
+    IODetailedTimingInformationV2 fDT[256]; unsigned fNDT = 0;
     IODisplayModeID fCurId = 1;
     struct NvKmsKapiDisplayMode fBootMode = {};
     NvU32 fBootW = 0, fBootH = 0, fBootPitch = 0;
@@ -464,6 +466,7 @@ public:
     IOReturn callPlatformFunction(const OSSymbol *functionName, bool waitForFunction,
                                   void *param1, void *param2, void *param3, void *param4) APPLE_KEXT_OVERRIDE;
     bool     vramGrant(struct NVRMVramRequest *r);
+    bool     vramGrantUnmapped(struct NVRMVramRequest *r, NvU64 want);
     bool     vramRelease(struct NVRMVramRequest *r);
     uint32_t fVramGrantLogged = 0;
     uint32_t fVramGrants = 0;
@@ -2953,6 +2956,15 @@ IOReturn NVRMNVDAFramebuffer::validateDetailedTiming(void *description, IOByteCo
     }
     return kIOReturnSuccess;
 }
+// The order setDetailedTimings keeps macOS's timings in under nvfbscalehz=<hz>: 0 unscaled, 1 a scaled desktop at
+// that refresh rate, 2 any other scaled desktop.
+static unsigned nvrmMacTimingClass(const IODetailedTimingInformationV2 *d, uint32_t hz)
+{
+    if (!d->horizontalScaled || !d->verticalScaled) return 0;
+    const UInt64 tot = (UInt64)(d->horizontalActive + d->horizontalBlanking) * (d->verticalActive + d->verticalBlanking);
+    const UInt64 dhz = tot ? (d->pixelClock + tot / 2) / tot : 0;
+    return dhz + 1 >= hz && dhz <= hz + 1 ? 1 : 2;
+}
 IOReturn NVRMNVDAFramebuffer::setDetailedTimings(OSArray *array)
 {
     if (!array) {
@@ -2960,12 +2972,26 @@ IOReturn NVRMNVDAFramebuffer::setDetailedTimings(OSArray *array)
         if (fCurId != kModeId) FBLOG("setDetailedTimings(NULL) while 0x%x is on the head -- it stays until the next setDisplayMode", (unsigned)fCurId);
         return kIOReturnSuccess;
     }
-    unsigned n = 0, bad = 0;
-    for (unsigned i = 0; i < array->getCount() && n < 64; i++) {  // 64 from macOS; the rest of fDT is for addKmsRefreshModes
-        OSData *data = OSDynamicCast(OSData, array->getObject(i));
-        if (!data || data->getLength() < sizeof(IODetailedTimingInformationV2)) { bad++; continue; }
-        nvu_copy(&fDT[n++], data->getBytesNoCopy(), sizeof(IODetailedTimingInformationV2));
-    }
+    // macOS offers a scaled (HiDPI) desktop for every scale-resolutions entry at every refresh rate of the native raster,
+    // the 60 Hz ones first: 536 timings for a 1080p 60/144/180/200 Hz panel with a long override list, whose first 180 Hz
+    // desktop is entry 307. Keeping the first 64 dropped every desktop on a faster rate, so HiDPI stayed at 60 Hz while the
+    // native raster ran at 180 Hz. nvfbscalehz=<hz> (opt-in) keeps the unscaled timings first, then the scaled desktops at
+    // that rate, then the rest in macOS's order, up to kMacTimings. Without it the first 64 are kept, as before.
+    uint32_t scaleHz = 0;
+    if (!PE_parse_boot_argn("nvfbscalehz", &scaleHz, sizeof scaleHz)) scaleHz = 0;
+    const unsigned count = array->getCount(), limit = scaleHz ? (unsigned)kMacTimings : 64u;
+    unsigned n = 0, bad = 0, atHz = 0;
+    for (unsigned pass = scaleHz ? 0 : 2; pass < 3; pass++)
+        for (unsigned i = 0; i < count && n < limit; i++) {
+            OSData *data = OSDynamicCast(OSData, array->getObject(i));
+            if (!data || data->getLength() < sizeof(IODetailedTimingInformationV2)) { if (pass == 2) bad++; continue; }
+            const IODetailedTimingInformationV2 *d = (const IODetailedTimingInformationV2 *)data->getBytesNoCopy();
+            if (scaleHz && nvrmMacTimingClass(d, scaleHz) != pass) continue;
+            if (pass == 1) atHz++;
+            nvu_copy(&fDT[n++], d, sizeof *d);
+        }
+    if (scaleHz)
+        FBLOG("fb%u nvfbscalehz=%u: kept %u of %u macOS timings, %u of them scaled desktops at %u Hz", fIndex, scaleHz, n, count, atHz, scaleHz);
     const unsigned fromMac = n;
     n = addKmsRefreshModes(n);
     fNDT = n;
@@ -3191,6 +3217,18 @@ SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_budget_bytes, CTLFLAG_RD | CTLFLAG_LOC
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_mapped_bytes,  CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gVramMappedBytes,  "the BAR1 budget counter, live");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_display_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gVramDisplayBytes, "scanout+cursor the framebuffer itself maps into BAR1");
 SYSCTL_INT(_debug, OID_AUTO, nvrmfb_vram_display_aware, CTLFLAG_RW | CTLFLAG_LOCKED, &gVramDisplayAware, 0, "1 = the accel budget reserves the BAR1 the display holds; 0 = the old fixed fraction");
+// Unmapped grants. Once the BAR1 budget is spent, every further surface was refused VRAM (20,000 refusals in a few
+// minutes on a GTX 1660 SUPER, whose BAR1 cannot grow past 256 MB) and fell back to a private image per process plus a
+// copy through system memory on every frame. The GPU never needed the BAR1 mapping: sharing, flips and page-off all go
+// through the RM handle. A caller that says it copes (NVRM_VRAM_FLAG_UNMAPPED_OK) now gets VRAM with no mapping
+// instead, up to the cap. On by default (debug.nvrmfb_vram_unmapped=0 turns it off for grants made afterwards).
+static int gVramUnmapped = 1, gVramUnmappedCapMB = 2048;
+static volatile SInt64 gVramUnmappedBytes = 0, gCntUnmappedGrant = 0, gCntUnmappedRefused = 0;
+SYSCTL_INT(_debug, OID_AUTO, nvrmfb_vram_unmapped, CTLFLAG_RW | CTLFLAG_LOCKED, &gVramUnmapped, 0, "1 = past the BAR1 budget, grant VRAM with no BAR1 mapping to callers that accept it");
+SYSCTL_INT(_debug, OID_AUTO, nvrmfb_vram_unmapped_cap_mb, CTLFLAG_RW | CTLFLAG_LOCKED, &gVramUnmappedCapMB, 0, "most VRAM held by unmapped grants at once, MB");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_unmapped_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gVramUnmappedBytes, "VRAM held by unmapped grants, live");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_unmapped_grants, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntUnmappedGrant, "unmapped grants made");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_unmapped_refused, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntUnmappedRefused, "unmapped grants refused (cap reached or allocateMemory failed)");
 static struct NVRMVramRequest gVramTest[256]; static int gVramTestN; static int gVramTestMode;
 static int nvrmfb_vramtest_sysctl SYSCTL_HANDLER_ARGS
 {
@@ -3248,6 +3286,9 @@ static void nvrmfbInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvrmfb_vram_releases); sysctl_register_oid(&sysctl__debug_nvrmfb_vram_release_bytes);
     sysctl_register_oid(&sysctl__debug_nvrmfb_vram_mapped_bytes); sysctl_register_oid(&sysctl__debug_nvrmfb_vram_budget_bytes);
     sysctl_register_oid(&sysctl__debug_nvrmfb_vram_display_bytes); sysctl_register_oid(&sysctl__debug_nvrmfb_vram_display_aware);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_vram_unmapped); sysctl_register_oid(&sysctl__debug_nvrmfb_vram_unmapped_cap_mb);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_vram_unmapped_bytes); sysctl_register_oid(&sysctl__debug_nvrmfb_vram_unmapped_grants);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_vram_unmapped_refused);
     sysctl_register_oid(&sysctl__debug_nvrmfb_vramtest); sysctl_register_oid(&sysctl__debug_nvrmfb_vramtest_mode);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_interval); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_us_sum);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_n); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_us_max);
@@ -3261,6 +3302,8 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
 {
     NVRMDisplayGate gate; if (!gate.valid()) return false;
     nvrmfbInstallSysctl();
+    const bool unmappedOk = (r->flags & NVRM_VRAM_FLAG_UNMAPPED_OK) != 0;
+    r->flags &= ~NVRM_VRAM_FLAG_UNMAPPED;
     r->phys = 0; r->kva = nullptr; r->handle = nullptr; r->actualSize = 0; r->mappedTotal = 0;
     if (!fKms || !fDev) { FBLOG("nvAllocVram: no NVKMS device yet"); return false; }
     NvU64 want = (r->size + 0xFFFFull) & ~0xFFFFull;
@@ -3273,6 +3316,7 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
     SInt64 before = OSAddAtomic64((SInt64)want, &gVramMappedBytes) + gVramParkedBytes;
     if (before + (SInt64)want > budget) {
         OSAddAtomic64(-(SInt64)want, &gVramMappedBytes);
+        if (gVramUnmapped && unmappedOk) return vramGrantUnmapped(r, want);
         // A full 256 MB window is refused thousands of times in a session (one size, retried every frame: 1,413 lines in
         // one user log), and each line costs a kernel log write on the path that is already out of room. Log the first
         // eight, then every 256th with the running count, and say once who holds the window: grants against releases
@@ -3384,6 +3428,9 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
     }
     if (!mem) {
         OSAddAtomic64(-(SInt64)want, &gVramMappedBytes);
+        // under the budget, yet no mapping: RM's own BAR1 mappings and fragmentation leave less of the window than the
+        // budget counts (mapMemory failed at 196 MB of a 208 MB budget). The VRAM itself is there.
+        if (gVramUnmapped && unmappedOk) return vramGrantUnmapped(r, want);
         // Who holds the window, once per boot: a 256 MB BAR1 that fills up cannot be told apart from a leak by the
         // failure lines alone; grants against releases can.
         static volatile SInt32 said = 0;
@@ -3430,6 +3477,53 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
     return true;
 }
 
+// VRAM with no BAR1 mapping: no kernel address, no physical address, and so no zero fill and no overlap check (both
+// are about the BAR1 window). Its first contents are whatever the VRAM held; the Metal plugin uploads a surface's
+// system memory before it trusts the VRAM copy (its seed tag), and NVAccel never flips or pages off a copy the plugin
+// has not written (fPluginWroteCookie).
+bool NVRMNVDAFramebuffer::vramGrantUnmapped(struct NVRMVramRequest *r, NvU64 want)
+{
+    const SInt64 cap = (SInt64)gVramUnmappedCapMB << 20;
+    if (OSAddAtomic64((SInt64)want, &gVramUnmappedBytes) + (SInt64)want > cap) {
+        OSAddAtomic64(-(SInt64)want, &gVramUnmappedBytes);
+        const SInt64 n = OSAddAtomic64(1, &gCntUnmappedRefused) + 1;
+        if (n <= 8 || (n & 255) == 0)
+            FBLOG("nvAllocVram(%llu): unmapped REFUSED (#%lld) -- cap %d MB reached (%lld bytes held)",
+                  (unsigned long long)want, (long long)n, gVramUnmappedCapMB, (long long)gVramUnmappedBytes);
+        return false;
+    }
+    struct NvKmsKapiAllocateMemoryParams mp; nvu_zero(&mp, sizeof mp);
+    NvU8 compressible = 0;
+    mp.layout = NvKmsSurfaceMemoryLayoutPitch;
+    mp.type   = NVKMS_KAPI_ALLOCATION_TYPE_SCANOUT;
+    mp.size   = want;
+    mp.useVideoMemory = NV_TRUE;
+    mp.compressible   = &compressible;
+    struct NvKmsKapiMemory *mem = fKms->allocateMemory(fDev, &mp);
+    const UInt64 allocationCookie = mem ? gAllocations.insert(mem, want) : 0;
+    if (!allocationCookie) {
+        if (mem) fKms->freeMemory(fDev, mem);
+        OSAddAtomic64(-(SInt64)want, &gVramUnmappedBytes);
+        const SInt64 n = OSAddAtomic64(1, &gCntUnmappedRefused) + 1;
+        if (n <= 8 || (n & 255) == 0)
+            FBLOG("nvAllocVram(%llu): unmapped REFUSED (#%lld) -- %s", (unsigned long long)want, (long long)n,
+                  mem ? "allocation table full" : "allocateMemory failed");
+        return false;
+    }
+    r->allocationCookie = allocationCookie;
+    advanceFlipEpoch();   // as for a mapped grant: before the caller can see this memory
+    r->handle = mem; r->kva = nullptr; r->phys = 0;
+    r->actualSize = (unsigned long long)want;
+    r->mappedTotal = (unsigned long long)gVramMappedBytes;
+    r->flags |= NVRM_VRAM_FLAG_UNMAPPED;
+    const SInt64 n = OSAddAtomic64(1, &gCntUnmappedGrant) + 1;
+    OSAddAtomic64(1, &gCntGrant); OSAddAtomic64((SInt64)want, &gCntGrantBytes);
+    if (n <= 16 || (n & 1023) == 0)
+        FBLOG("nvAllocVram #%lld unmapped: %llu bytes of VRAM, no BAR1 mapping (%lld bytes unmapped, BAR1 %lld bytes)",
+              (long long)n, (unsigned long long)want, (long long)gVramUnmappedBytes, (long long)gVramMappedBytes);
+    return true;
+}
+
 bool NVRMNVDAFramebuffer::vramRelease(struct NVRMVramRequest *r)
 {
     NVRMDisplayGate gate; if (!gate.valid()) return false;
@@ -3437,9 +3531,10 @@ bool NVRMNVDAFramebuffer::vramRelease(struct NVRMVramRequest *r)
     if (!mem || !fKms || !fDev) return false;
     if (!gAllocations.remove(mem, r->allocationCookie)) return false;
     advanceFlipEpoch();   // every cached surface made before this free stops matching (see gFlipEpoch)
-    if (r->kva) fKms->unmapMemory(fDev, mem, NVKMS_KAPI_MAPPING_TYPE_KERNEL, r->kva);
+    const bool unmapped = (r->flags & NVRM_VRAM_FLAG_UNMAPPED) != 0;
+    if (r->kva && !unmapped) fKms->unmapMemory(fDev, mem, NVKMS_KAPI_MAPPING_TYPE_KERNEL, r->kva);
     fKms->freeMemory(fDev, mem);
-    if (r->actualSize) OSAddAtomic64(-(SInt64)r->actualSize, &gVramMappedBytes);
+    if (r->actualSize) OSAddAtomic64(-(SInt64)r->actualSize, unmapped ? &gVramUnmappedBytes : &gVramMappedBytes);
     OSAddAtomic64(1, &gCntRelease); OSAddAtomic64((SInt64)r->actualSize, &gCntReleaseBytes);
     r->handle = nullptr; r->kva = nullptr; r->phys = 0; r->actualSize = 0; r->allocationCookie = 0;
     return true;

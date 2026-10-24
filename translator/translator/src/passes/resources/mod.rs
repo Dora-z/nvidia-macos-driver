@@ -16,6 +16,7 @@ pub(in crate::passes) use discovery::*;
 pub(in crate::passes) use query_select::rewrite_resource_query_selects;
 pub(in crate::passes) use selected_load::materialize_interface_selected_loads;
 pub(in crate::passes) use texture_array::{
-    materialize_texture_array_loads, retire_dead_pointer_projections,
+    materialize_sampler_array_loads, materialize_texture_array_loads, retire_dead_pointer_projections,
+    split_constant_descriptor_array_elements,
     sink_loop_header_texture_array_loads,
 };

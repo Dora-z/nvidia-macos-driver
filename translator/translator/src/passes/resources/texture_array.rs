@@ -390,6 +390,328 @@ pub(crate) fn materialize_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
     retire_dead_pointer_projections(ctx, entry_idx, dead_roots.iter().copied());
 }
 
+/// `array<sampler, N>` entry parameters (lowered to UniformConstant sampler arrays in build_stage_input): every
+/// sampler a texture call takes from one becomes an OpAccessChain into that array and an OpLoad of OpTypeSampler, which
+/// the sample lowering accepts as it accepts a plain sampler parameter. The element is found the way texture array
+/// elements are: the emitter's field-load facts for the byval copy, else a load through an access chain on the array.
+pub(crate) fn materialize_sampler_array_loads(ctx: &mut Ctx, entry_idx: usize) {
+    if ctx.sampler_array_vars.is_empty() {
+        return;
+    }
+    let names = air_names(&ctx.module);
+    let mut defs: HashMap<Word, Instruction> = HashMap::new();
+    for blk in &ctx.module.functions[entry_idx].blocks {
+        for inst in &blk.instructions {
+            if let Some(rid) = inst.result_id {
+                defs.insert(rid, inst.clone());
+            }
+        }
+    }
+    let fixed = ctx
+        .emit_sidecar
+        .local_pointer_field_loads
+        .iter()
+        .filter(|fact| ctx.sampler_array_vars.contains(&fact.root))
+        .filter_map(|fact| match fact.indices.as_slice() {
+            [element] | [element, 0] => Some((fact.id, fact.root, *element)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mut known: HashMap<Word, (Word, Word)> = fixed
+        .into_iter()
+        .map(|(id, root, element)| (id, (root, ctx.const_uint(element))))
+        .collect();
+    known.extend(
+        ctx.emit_sidecar
+            .local_pointer_dynamic_field_loads
+            .iter()
+            .filter(|fact| {
+                ctx.sampler_array_vars.contains(&fact.root)
+                    && fact.prefix.is_empty()
+                    && (fact.suffix.is_empty() || fact.suffix.as_slice() == [0])
+            })
+            .map(|fact| (fact.id, (fact.root, fact.index))),
+    );
+    for (id, resolved) in known.clone() {
+        let mut alias = id;
+        for _ in 0..8 {
+            let Some(inst) = defs
+                .get(&alias)
+                .filter(|inst| inst.class.opcode == Op::CopyObject)
+            else {
+                break;
+            };
+            let Some(Operand::IdRef(source)) = inst.operands.first() else {
+                break;
+            };
+            known.entry(*source).or_insert(resolved);
+            alias = *source;
+        }
+    }
+
+    let mut handles: HashMap<Word, (Word, Word)> = HashMap::new();
+    let mut handle_order: Vec<Word> = Vec::new();
+    let mut candidates: Vec<(Word, Word)> = Vec::new();
+    for blk in &ctx.module.functions[entry_idx].blocks {
+        for inst in &blk.instructions {
+            if inst.class.opcode != Op::FunctionCall {
+                continue;
+            }
+            let Some(Operand::IdRef(callee)) = inst.operands.first() else {
+                continue;
+            };
+            if !names.get(callee).is_some_and(|name| is_texture_intrinsic(name)) {
+                continue;
+            }
+            // operand 1 is the texture; a sampler comes after it
+            for operand in inst.operands.iter().skip(2) {
+                let Operand::IdRef(value) = operand else {
+                    continue;
+                };
+                if handles.contains_key(value) || candidates.iter().any(|(v, _)| v == value) {
+                    continue;
+                }
+                if let Some(&resolved) = known.get(value) {
+                    handles.insert(*value, resolved);
+                    handle_order.push(*value);
+                    continue;
+                }
+                let Some(load) = defs.get(value).filter(|load| load.class.opcode == Op::Load) else {
+                    continue;
+                };
+                if let Some(Operand::IdRef(ptr)) = load.operands.first() {
+                    candidates.push((*value, *ptr));
+                }
+            }
+        }
+    }
+    for (value, ptr) in candidates {
+        if let Some(resolved) = resolve_sampler_array_element(ctx, &defs, ptr) {
+            handles.insert(value, resolved);
+            handle_order.push(value);
+        }
+    }
+    if handles.is_empty() {
+        return;
+    }
+
+    let sty = ctx.ty_sampler();
+    let ptr_sampler = ctx.ty_ptr(StorageClass::UniformConstant, sty);
+    let mut chains: HashMap<Word, (Instruction, Word)> = HashMap::new();
+    let mut dead_roots: Vec<Word> = Vec::new();
+    for &handle in &handle_order {
+        let Some(load) = defs.get(&handle) else {
+            continue;
+        };
+        let (arrayvar, idx) = handles[&handle];
+        let p = ctx.module.fresh_id();
+        chains.insert(
+            handle,
+            (
+                Instruction::new(
+                    Op::AccessChain,
+                    Some(ptr_sampler),
+                    Some(p),
+                    vec![Operand::IdRef(arrayvar), Operand::IdRef(idx)],
+                ),
+                p,
+            ),
+        );
+        if let Some(Operand::IdRef(old_ptr)) = load.operands.first() {
+            if *old_ptr != arrayvar {
+                dead_roots.push(*old_ptr);
+            }
+        }
+        dead_roots.push(arrayvar);
+    }
+
+    let func = &mut ctx.module.functions[entry_idx];
+    for blk in func.blocks.iter_mut() {
+        let mut rebuilt: Vec<Instruction> = Vec::with_capacity(blk.instructions.len() + chains.len());
+        for inst in blk.instructions.clone() {
+            if let Some((chain, p)) = inst.result_id.and_then(|id| chains.get(&id)) {
+                rebuilt.push(chain.clone());
+                let mut load = inst;
+                load.class.opcode = Op::Load;
+                load.result_type = Some(sty);
+                load.operands = vec![Operand::IdRef(*p)];
+                rebuilt.push(load);
+                continue;
+            }
+            rebuilt.push(inst);
+        }
+        blk.instructions = rebuilt;
+    }
+    ctx.emit_sidecar
+        .local_pointer_dynamic_field_loads
+        .retain(|fact| !handles.contains_key(&fact.id));
+    retire_dead_pointer_projections(ctx, entry_idx, dead_roots.iter().copied());
+}
+
+/// resolve_array_element for sampler arrays: the array itself is element 0, an access chain on it names its element.
+fn resolve_sampler_array_element(
+    ctx: &mut Ctx,
+    defs: &HashMap<Word, Instruction>,
+    mut ptr: Word,
+) -> Option<(Word, Word)> {
+    for _ in 0..8 {
+        if ctx.sampler_array_vars.contains(&ptr) {
+            let zero = ctx.const_uint(0);
+            return Some((ptr, zero));
+        }
+        let inst = defs.get(&ptr)?;
+        match inst.class.opcode {
+            Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain => {
+                let Operand::IdRef(base) = inst.operands.first()? else {
+                    return None;
+                };
+                let mut root = *base;
+                for _ in 0..8 {
+                    if ctx.sampler_array_vars.contains(&root) {
+                        break;
+                    }
+                    let def = defs.get(&root)?;
+                    if !matches!(def.class.opcode, Op::Bitcast | Op::CopyObject) {
+                        return None;
+                    }
+                    let Operand::IdRef(src) = def.operands.first()? else {
+                        return None;
+                    };
+                    root = *src;
+                }
+                if !ctx.sampler_array_vars.contains(&root) {
+                    return None;
+                }
+                let Operand::IdRef(idx) = inst.operands.get(1)? else {
+                    return None;
+                };
+                return Some((root, *idx));
+            }
+            Op::Bitcast | Op::CopyObject => {
+                let Operand::IdRef(src) = inst.operands.first()? else {
+                    return None;
+                };
+                ptr = *src;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// The driver's descriptor layout gives every Metal texture and sampler slot a binding of one descriptor, and NVK
+/// clamps an element of a descriptor array to the descriptors its own binding has: element k of the array at binding b
+/// read slot b's descriptor, never slot b+k's (every element of a texture or sampler array sampled element 0). An
+/// element taken with a constant index -- GLSL ES only allows constant sampler-array indices, so all of ANGLE's are -- is
+/// pointed at a variable of its own at binding b+k instead, which has the element's pointer type. Dynamic indices keep
+/// the array variable.
+pub(crate) fn split_constant_descriptor_array_elements(ctx: &mut Ctx, entry_idx: usize) {
+    let heaps: HashSet<Word> = ctx.bindless_heap_vars.values().copied().collect();
+    let arrays: HashSet<Word> = ctx
+        .image_array_vars
+        .keys()
+        .copied()
+        .filter(|var| !heaps.contains(var))
+        .chain(ctx.sampler_array_vars.iter().copied())
+        .collect();
+    if arrays.is_empty() {
+        return;
+    }
+    let mut set_binding: HashMap<Word, (Option<u32>, Option<u32>)> = HashMap::new();
+    for inst in &ctx.module.annotations {
+        if inst.class.opcode != Op::Decorate {
+            continue;
+        }
+        let (Some(Operand::IdRef(id)), Some(Operand::Decoration(decoration)), Some(Operand::LiteralBit32(value))) =
+            (inst.operands.first(), inst.operands.get(1), inst.operands.get(2))
+        else {
+            continue;
+        };
+        if !arrays.contains(id) {
+            continue;
+        }
+        let entry = set_binding.entry(*id).or_insert((None, None));
+        match decoration {
+            spirv::Decoration::DescriptorSet => entry.0 = Some(*value),
+            spirv::Decoration::Binding => entry.1 = Some(*value),
+            _ => {}
+        }
+    }
+    let constants: HashMap<Word, u32> = ctx
+        .module
+        .types_global_values
+        .iter()
+        .chain(ctx.new_globals.iter())
+        .filter(|inst| inst.class.opcode == Op::Constant)
+        .filter_map(|inst| match (inst.result_id, inst.operands.first()) {
+            (Some(id), Some(Operand::LiteralBit32(value))) => Some((id, *value)),
+            _ => None,
+        })
+        .collect();
+
+    let mut element_vars: HashMap<(Word, u32), Word> = HashMap::new();
+    let mut replaced: HashMap<Word, Word> = HashMap::new();
+    let mut wanted: Vec<(Word, Word, u32, Word)> = Vec::new();   // chain id, array, element, pointer type
+    for blk in &ctx.module.functions[entry_idx].blocks {
+        for inst in &blk.instructions {
+            if !matches!(inst.class.opcode, Op::AccessChain | Op::InBoundsAccessChain) || inst.operands.len() != 2 {
+                continue;
+            }
+            let (Some(id), Some(ptr_ty), Operand::IdRef(base), Operand::IdRef(idx)) =
+                (inst.result_id, inst.result_type, &inst.operands[0], &inst.operands[1])
+            else {
+                continue;
+            };
+            if !arrays.contains(base) {
+                continue;
+            }
+            if let Some(&element) = constants.get(idx) {
+                wanted.push((id, *base, element, ptr_ty));
+            }
+        }
+    }
+    for (chain, array, element, ptr_ty) in wanted {
+        let Some(&(Some(set), Some(binding))) = set_binding.get(&array) else {
+            continue;
+        };
+        let var = match element_vars.get(&(array, element)) {
+            Some(&var) => var,
+            None => {
+                let var = ctx.module.fresh_id();
+                ctx.new_globals.push(Instruction::new(
+                    Op::Variable,
+                    Some(ptr_ty),
+                    Some(var),
+                    vec![Operand::StorageClass(StorageClass::UniformConstant)],
+                ));
+                crate::passes::resources::decorate_binding(&mut ctx.module, var, set, binding + element);
+                ctx.interface_buffer_var(var);
+                element_vars.insert((array, element), var);
+                var
+            }
+        };
+        replaced.insert(chain, var);
+    }
+    if replaced.is_empty() {
+        return;
+    }
+    for function in ctx.module.functions.iter_mut() {
+        for blk in function.blocks.iter_mut() {
+            blk.instructions
+                .retain(|inst| !inst.result_id.is_some_and(|id| replaced.contains_key(&id)));
+            for inst in blk.instructions.iter_mut() {
+                for operand in inst.operands.iter_mut() {
+                    if let Operand::IdRef(id) = operand {
+                        if let Some(&var) = replaced.get(id) {
+                            *id = var;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn sink_loop_header_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
     if ctx.image_array_vars.is_empty() {
         return;

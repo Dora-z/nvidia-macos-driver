@@ -1224,6 +1224,48 @@ static bool nvmtl_surfin_import(void) {
     if (on < 0) { const char *u = getenv("NVMTL_SURFIN_UPLOAD"); on = !(u && !strcmp(u, "cpu")); }
     return on;
 }
+// NVMTL_SURFIN_STATS=1 (environment or nvrm610.conf): every 2 s, syslog how many surface-ins this process ran, their
+// bytes and the time spent in them, and the sizes seen most often (a release build logs failures only, so this goes to
+// syslog itself). A knob, not a /tmp file: release builds refuse /tmp/nvmtl-* switches in every process.
+static struct { uint64_t n, bytes, ns, async, since; uint32_t w[8], h[8], cnt[8]; } g_sistat;
+static pthread_mutex_t g_sistat_mu = PTHREAD_MUTEX_INITIALIZER;
+static int nvmtl_surfin_stats_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_SURFIN_STATS"); on = e && e[0] == '1'; }
+    return on;
+}
+static void nvmtl_surfin_stat(uint32_t w, uint32_t h, size_t bytes, uint64_t ns, int async) {
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    pthread_mutex_lock(&g_sistat_mu);
+    if (!g_sistat.since) g_sistat.since = now;
+    g_sistat.n++; g_sistat.bytes += bytes; g_sistat.ns += ns; g_sistat.async += async != 0;
+    int k = 0, low = 0;
+    for (; k < 8 && g_sistat.cnt[k] && !(g_sistat.w[k] == w && g_sistat.h[k] == h); k++) if (g_sistat.cnt[k] < g_sistat.cnt[low]) low = k;
+    if (k == 8) { k = low; g_sistat.cnt[k] = 0; }
+    g_sistat.w[k] = w; g_sistat.h[k] = h; g_sistat.cnt[k]++;
+    if (now - g_sistat.since >= 2000000000ull) {
+        const double s = (now - g_sistat.since) / 1e9; char top[160] = ""; size_t off = 0;
+        for (int pass = 0; pass < 3; pass++) {
+            int best = -1;
+            for (int i = 0; i < 8; i++) if (g_sistat.cnt[i] && (best < 0 || g_sistat.cnt[i] > g_sistat.cnt[best])) best = i;
+            if (best < 0) break;
+            int wr = snprintf(top + off, sizeof top - off, "%s%ux%u x%u", off ? ", " : "", g_sistat.w[best], g_sistat.h[best], g_sistat.cnt[best]);
+            if (wr > 0 && (size_t)wr < sizeof top - off) off += (size_t)wr;
+            g_sistat.cnt[best] = 0;
+        }
+        syslog(LOG_NOTICE, "NullMoth: surface-in stats %s: %.1f/s, %.1f MB/s, %.2f ms per frame-second (%.2f ms avg), %llu async; top %s",
+               getprogname(), g_sistat.n / s, g_sistat.bytes / s / 1e6, g_sistat.ns / s / 1e6, g_sistat.n ? g_sistat.ns / 1e6 / g_sistat.n : 0,
+               (unsigned long long)g_sistat.async, top);
+        memset(&g_sistat, 0, sizeof g_sistat);
+    }
+    pthread_mutex_unlock(&g_sistat_mu);
+}
+// An async surface-in holds the surface's read lock and a retain until its copy is finished (nvmtl_asyncup_finish).
+static void nvmtl_surfin_release(void *ctx) {
+    IOSurfaceRef s = (IOSurfaceRef)ctx;
+    IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
+    CFRelease(s);
+}
 - (void)nvmtlSurfaceIn {
     NVMTLTexture *r = _parent ? _parent : self;
     if (!r->_surf) return;
@@ -1237,17 +1279,26 @@ static bool nvmtl_surfin_import(void) {
           static unsigned ns; if (ns++ < 6 || ns % 2000 == 0) nvlog("item 7: surface-in SKIPPED (shared VRAM current at seed %u): %llu skipped, %llu copied", now, g_surfin_skip, g_surfin_copy);
           return; } }
     uint32_t seed = 0;
+    const int stats = nvmtl_surfin_stats_on(); const uint64_t t0 = stats ? clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) : 0;
     if (IOSurfaceLock(r->_surf, kIOSurfaceLockReadOnly, &seed) != kIOReturnSuccess) { nvlog("G13 surface-in: IOSurfaceLock FAILED"); return; }
     void *base = IOSurfaceGetBaseAddressOfPlane(r->_surf, (uint32_t)r->_plane);
     size_t row = IOSurfaceGetBytesPerRowOfPlane(r->_surf, (uint32_t)r->_plane);
-    int rc = -1;
+    int rc = -1, async = 0;
     if (base && row && nvmtl_surfin_import()) {
         const size_t off = (size_t)((uint8_t *)base - (uint8_t *)IOSurfaceGetBaseAddress(r->_surf));
-        rc = nvmtl_vk_image_write_host(r->_q, &r->_i, base, row, IOSurfaceGetAllocSize(r->_surf) - off);
+        if (nvmtl_async_surfin()) {
+            // the lock taken above and a retain go to the in-flight copy; nvmtl_surfin_release gives both back
+            CFRetain(r->_surf);
+            rc = nvmtl_vk_image_write_host_async(r->_q, &r->_i, base, row, IOSurfaceGetAllocSize(r->_surf) - off,
+                                                 nvmtl_surfin_release, (void *)r->_surf);
+            if (rc) CFRelease(r->_surf); else async = 1;
+        }
+        if (!async) rc = nvmtl_vk_image_write_host(r->_q, &r->_i, base, row, IOSurfaceGetAllocSize(r->_surf) - off);
     }
     if (rc) rc = (base && row) ? nvmtl_vk_image_write(r->_q, &r->_i, base, row) : -1;
-    if (!rc && r->_i.bpp == 4) { char tag[24]; snprintf(tag, sizeof tag, "in%u-", (unsigned)IOSurfaceGetID(r->_surf)); nvmtl_frame_dump(tag, base, row, r->_i.w, r->_i.h); }
-    IOSurfaceUnlock(r->_surf, kIOSurfaceLockReadOnly, NULL);
+    if (!rc && !async && r->_i.bpp == 4) { char tag[24]; snprintf(tag, sizeof tag, "in%u-", (unsigned)IOSurfaceGetID(r->_surf)); nvmtl_frame_dump(tag, base, row, r->_i.w, r->_i.h); }
+    if (!async) IOSurfaceUnlock(r->_surf, kIOSurfaceLockReadOnly, NULL);
+    if (stats && !rc) nvmtl_surfin_stat(r->_i.w, r->_i.h, (size_t)r->_i.h * row, clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0, async);
     if (rc) { nvlog("G13 surface-in: upload FAILED (%ux%u) — retried at the next use", r->_i.w, r->_i.h); return; }
     r->_surfSeed = seed; r->_surfSynced = YES; r->_surfGen = vgen;
     g_surfin_copy++; if (r->_vramOn) nvmtl_vram_tag_set(r->_surf, r->_plane, seed);
@@ -2743,10 +2794,14 @@ static BOOL nvmtl_pixel_sampler_update(NSMutableDictionary *states, NSString *in
             }
         }
         NSData *key=_pixelSamplerKey;
+        // same pipeline, same sampler values as this encoder's last draw: its choice stands (no lock, no lookup; ANGLE
+        // binds every draw)
+        if (_svSel && _svFor==_ps && _svKey==key) return _svSel==[NSNull null] ? nil : _svSel;
+        _svFor=_ps; _svKey=key; _svSel=nil;
         @synchronized(_ps) {
             if(!_ps->_samplerVariants) _ps->_samplerVariants=[NSMutableDictionary new];
             id cached=_ps->_samplerVariants[key];
-            if(cached==[NSNull null]) return nil;
+            if(cached==[NSNull null]) { _svSel=cached; return nil; }
             selected=cached;
             if(!selected) {
                 // Reusing the key across pipelines still performs each pipeline's own variant lookup.
@@ -2765,12 +2820,13 @@ static BOOL nvmtl_pixel_sampler_update(NSMutableDictionary *states, NSString *in
                     if(!selected)why=error.description;
                     else nvmtl_sampvar_put(gk,selected,vf,ff);
                 }
-                if(!selected){nvlog("pixel sampler specialization REFUSED %s: %s",_ps->_fname.UTF8String,why.UTF8String);_ps->_samplerVariants[key]=[NSNull null];return nil;}
+                if(!selected){nvlog("pixel sampler specialization REFUSED %s: %s",_ps->_fname.UTF8String,why.UTF8String);_ps->_samplerVariants[key]=[NSNull null];_svSel=[NSNull null];return nil;}
                 _ps->_samplerVariants[key]=selected;
                 nvlog("pixel sampler variant built: %s / %s",_ps->_vname.UTF8String,_ps->_fname.UTF8String);
             }
         }
     }
+    _svSel=selected;
     return selected;
 }
 - (BOOL)nvmtlBindSamplerPipeline {
@@ -2942,8 +2998,10 @@ static BOOL nvmtl_pixel_sampler_update(NSMutableDictionary *states, NSString *in
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)ps {
     // NVMTL_DUMP_PSO=<text>: the first encoder that sets a pipeline whose label contains it has the fragment buffers bound
     // at its end dumped, as NVMTL_DUMP_GROUP does, for apps that label pipelines but push no debug groups (diagnostic)
+    // The same pipeline again inside a begun pass (Apple's GL renderer sets it before every draw) changes nothing.
+    if (ps && (NVMTLRenderPipelineState *)ps == _ps && _begun && !(_cb->_c.pt_open && _cb->_c.pt_pool)) return;
     { static const char *want; static int once; static _Atomic int armed; if (!once) { once = 1; want = getenv("NVMTL_DUMP_PSO"); }
-      NSString *lbl = ps.label;
+      NSString *lbl = want ? ps.label : nil;
       if (want && !strcmp(want, "?") && lbl) { static NSMutableSet *seen; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
           pthread_mutex_lock(&mu); if (!seen) seen = [NSMutableSet new]; BOOL n = ![seen containsObject:lbl]; if (n) [seen addObject:lbl];
           pthread_mutex_unlock(&mu); if (n) nvlog("NVMTL_DUMP_PSO: pipeline label %s", lbl.UTF8String); }
@@ -3249,6 +3307,7 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
     [self nvmtlBeginVisibility];
 }
 - (void)endEncoding {
+    _svFor=nil; _svKey=nil; _svSel=nil;   // nothing of this encoder outlives it
     _cb->_nEnd++;
     if (_dumpPso) { _dumpPso = NO; [self nvmtlDumpBoundFragmentBuffers]; }
     [self nvmtlCloseVisibility];

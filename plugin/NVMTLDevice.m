@@ -499,19 +499,53 @@ static bool nvmtl_angle_chrome_family(void)
            strncmp(me, "Chromium", 8) == 0 ||
            strncmp(me, "Discord", 7) == 0;
 }
+// NVMTL_ANGLE_METAL may also be a comma-separated list of process names (getprogname: an Electron app's GPU process is
+// "<App> Helper", Edge's is "Microsoft Edge Helper") that get Metal besides the Chrome family, so one app can be moved
+// over without the others. This constructor comes before nvmtl_conf_knobs in this one-TU plugin and runs first, so a
+// value set only in nvrm610.conf was never seen here: with nothing in the environment, the conf is read for this key.
+static bool nvmtl_angle_conf_value(char *out, size_t n)
+{
+    FILE *f = fopen("/Library/GPUBundles/nvmtl/nvrm610.conf", "r");
+    if (!f) return false;
+    char line[512]; bool found = false;
+    while (!found && fgets(line, sizeof line, f)) {
+        if (strncmp(line, "NVMTL_ANGLE_METAL=", 18)) continue;
+        char *v = line + 18, *end = v + strlen(v);
+        while (end > v && (end[-1] == '\n' || end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t')) *--end = 0;
+        strlcpy(out, v, n); found = true;
+    }
+    fclose(f);
+    return found;
+}
+static bool nvmtl_angle_listed(const char *list, const char *me)
+{
+    if (!list || !me) return false;
+    char buf[512]; strlcpy(buf, list, sizeof buf);
+    char *save = NULL;
+    for (char *t = strtok_r(buf, ",", &save); t; t = strtok_r(NULL, ",", &save)) {
+        while (*t == ' ' || *t == '\t') t++;
+        char *end = t + strlen(t);
+        while (end > t && (end[-1] == ' ' || end[-1] == '\t')) *--end = 0;
+        if (*t && !strcmp(t, me)) return true;
+    }
+    return false;
+}
 __attribute__((constructor)) static void nvmtl_angle_allow_nvidia(void)
 {
+    char confv[512];
     const char *opt = getenv("NVMTL_ANGLE_METAL");
+    if (!opt && nvmtl_angle_conf_value(confv, sizeof confv)) opt = confv;
     if (opt && !strcmp(opt, "0")) return;
     const char *me = getprogname();
-    if (!(opt && !strcmp(opt, "1")) && !nvmtl_angle_chrome_family()) return;
+    const bool all = opt && !strcmp(opt, "1"), listed = !all && nvmtl_angle_listed(opt, me);
+    if (!all && !listed && !nvmtl_angle_chrome_family()) return;
     const char *key = "ANGLE_FEATURE_OVERRIDES_DISABLED", *rule = "disableMetalOnNvidia";
     const char *cur = getenv(key);
     if (cur && strstr(cur, rule)) return;
     // One line per process, outside nvlog's release failure filter: a field report must show whether the rule was
     // active in this process.
     syslog(LOG_NOTICE, "NullMoth: angle: Metal allowed in %s (%s; NVMTL_ANGLE_METAL=0 disables)", me ? me : "?",
-           (opt && !strcmp(opt, "1")) ? "NVMTL_ANGLE_METAL=1" : "Chrome family");
+           all ? "NVMTL_ANGLE_METAL=1" : listed ? "listed in NVMTL_ANGLE_METAL" : "Chrome family");
     char v[1024];
     if (cur && *cur) snprintf(v, sizeof v, "%s:%s", cur, rule); else snprintf(v, sizeof v, "%s", rule);
     setenv(key, v, 1);

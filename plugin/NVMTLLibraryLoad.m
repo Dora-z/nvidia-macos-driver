@@ -433,13 +433,14 @@ static NSCache *nvmtl_memo(void) {
 }
 
 static BOOL nvmtl_air_unroll_wanted(NSData *air);
+static BOOL nvmtl_air_texenv_wanted(NSData *air);
 static NSString *nvmtl_aircache_path(NSData *air) {
     unsigned char h[CC_SHA256_DIGEST_LENGTH];
     CC_SHA256(air.bytes, (CC_LONG)air.length, h);
     char hex[2 * CC_SHA256_DIGEST_LENGTH + 1];
     for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) snprintf(hex + 2 * i, 3, "%02x", h[i]);
     return [[nvmtl_aircache_dir() stringByAppendingPathComponent:@(hex)] stringByAppendingPathExtension:
-            nvmtl_air_unroll_wanted(air) ? @"u2.ll" : @"ll"];
+            nvmtl_air_unroll_wanted(air) ? @"u2.ll" : nvmtl_air_texenv_wanted(air) ? @"te1.ll" : @"ll"];
 }
 
 static BOOL nvmtl_run_air_opt(const char *input, const char *output) {
@@ -597,6 +598,17 @@ static BOOL nvmtl_air_unroll_wanted(NSData *air) {
     static const char needle[] = "air.simdgroup_matrix_8x8";
     return !off && air.length && memmem(air.bytes, air.length, needle, sizeof needle - 1) != NULL;
 }
+// ANGLE's Metal backend hands a GLSL sampler array to a helper through a local ANGLE_TextureEnvs struct holding a
+// pointer to every texture and sampler element, and leaves the helper un-inlined once there are five or more branches
+// over the array (xterm.js's glyph shader has sixteen). The translator cannot follow an element pointer through a struct
+// field into another function: every sample read a null texture, and the terminal drew nothing. Inlined and broken up
+// by SROA, each sample takes array element k directly, which the translator lowers to slot k.
+#define NVMTL_AIR_TEXENV_PIPELINE "cgscc(inline),function(sroa,early-cse,simplifycfg)"
+static BOOL nvmtl_air_texenv_wanted(NSData *air) {
+    static int off = -1; if (off < 0) off = getenv("NVMTL_NO_AIR_TEXENV") != NULL;
+    static const char needle[] = "ANGLE_TextureEnvs";
+    return !off && air.length && memmem(air.bytes, air.length, needle, sizeof needle - 1) != NULL;
+}
 // The largest shader library measured in a real app is a few megabytes. The reader we hand this to is
 // LLVM's, which its own documentation declines to call hardened against malicious input, so cap the blob
 // before it gets there: a library over the cap falls through to the out-of-process path below, where a
@@ -616,6 +628,12 @@ static NSString *nvmtl_air_in_memory(NSData *air) {
     void *module = NULL; NSString *result = nil;
     gAirError = 0;
     if (buffer && !nvLLVMParseBitcodeInContext2(context, buffer, &module) && module && !gAirError) {
+        if (nvLLVMRunPasses && nvmtl_air_texenv_wanted(air)) {
+            void *opts = nvLLVMCreatePassBuilderOptions();
+            void *err = nvLLVMRunPasses(module, NVMTL_AIR_TEXENV_PIPELINE, NULL, opts);
+            nvLLVMDisposePassBuilderOptions(opts);
+            if (err) { char *m = nvLLVMGetErrorMessage(err); nvlog("library: air texture-env inline FAILED (%s) - translating as decoded", m ? m : "?"); if (m) nvLLVMDisposeErrorMessage(m); }
+        }
         if (nvLLVMRunPasses && nvmtl_air_unroll_wanted(air)) {
             void *opts = nvLLVMCreatePassBuilderOptions();
             void *err = nvLLVMRunPasses(module, NVMTL_AIR_UNROLL_PIPELINE, NULL, opts);

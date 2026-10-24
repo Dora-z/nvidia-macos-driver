@@ -14,6 +14,13 @@
 
 #define NVRM_VRAM_BAR1_BUDGET (192ull * 1024ull * 1024ull)
 
+/* flags on nvAllocVram / nvFreeVram. UNMAPPED_OK (in): the caller can hold VRAM that has no BAR1 mapping (kva NULL,
+   phys 0); it reaches the memory only through its RM handle (zero-copy share, flips, copy-engine page-off). UNMAPPED
+   (out on a grant, in on a free): this allocation has no BAR1 mapping. A 256 MB BAR1 holds about ten window surfaces;
+   VRAM itself holds thousands. */
+#define NVRM_VRAM_FLAG_UNMAPPED_OK 0x1u
+#define NVRM_VRAM_FLAG_UNMAPPED    0x2u
+
 struct NVRMVramRequest {
     unsigned int       version;
     unsigned int       flags;

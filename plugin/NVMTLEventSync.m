@@ -114,8 +114,60 @@ static BOOL nvmtl_ws_surface_wait(void) {
 }
 // What one WindowServer command buffer holds: the surfaces it marked pending in the kernel, and the textures whose shared
 // VRAM its commit marked newest. early is fixed at commit (nvmtl_ws_surface_wait): the marks are released part by part.
-@interface NVMTLSurfaceHolds : NSObject { @public NSMutableSet *ids; NSSet *dirtied; BOOL early; } @end
+// reads: the shared surfaces it samples and does not write, marked as read in the kernel until the whole command buffer
+// has finished (nvmtl_ws_read_marks).
+@interface NVMTLSurfaceHolds : NSObject { @public NSMutableSet *ids; NSSet *dirtied; NSSet *reads; BOOL early; } @end
 @implementation NVMTLSurfaceHolds @end
+// Reads of shared surface VRAM, with NVAccel's read marks. WindowServer composites an application's window straight
+// from the application's IOSurface VRAM, and the application draws its next frame into that surface once CoreAnimation
+// hands it back - which can come before WindowServer's GPU has finished reading it. The composite then shows a half-drawn
+// frame: Claude's sticky title bar showed the content scrolled under it on a fast scroll. WindowServer marks the shared
+// surfaces a command buffer samples when it commits and clears them when it has finished; every other process waits in
+// the kernel for those marks before it commits a write to a shared surface (nvmtl_shared_read_wait). Read once per
+// process; NVMTL_NO_READ_MARKS=1 turns it off.
+static BOOL nvmtl_ws_read_marks(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("NVMTL_NO_READ_MARKS");
+        on = !(e && e[0] == '1') && nvmtl_vk_accel_read_marks() ? 1 : 0;
+        nvlog("shared surface reads: %s", on ? "WindowServer marks them, writers wait in NVAccel" : "not ordered (NVAccel without read marks, or NVMTL_NO_READ_MARKS)");
+    }
+    return on == 1;
+}
+static NSObject *nvmtl_ws_lock(void);
+static NSCountedSet *nvmtl_ws_read_holds;
+static void nvmtl_ws_read_release(NSSet *reads) {
+    if (!reads.count) return;
+    @synchronized (nvmtl_ws_lock()) {
+        for (NSNumber *n in reads) {
+            [nvmtl_ws_read_holds removeObject:n];
+            if (![nvmtl_ws_read_holds countForObject:n]) (void)nvmtl_vk_surface_read_mark(n.unsignedIntValue, 0);
+        }
+    }
+}
+static BOOL nvmtl_is_windowserver(void) {
+    static int ws = -1;
+    if (ws < 0) ws = getprogname() && !strcmp(getprogname(), "WindowServer");
+    return ws == 1;
+}
+// Before a command buffer of an application reaches the GPU: each shared surface it writes waits until WindowServer's
+// GPU has finished reading it (at most 50 ms, in NVAccel).
+static void nvmtl_shared_read_wait(NVMTLCommandBuffer *cb) {
+    if (nvmtl_is_windowserver() || !nvmtl_ws_read_marks()) return;
+    uint32_t seen[16]; unsigned n = 0;
+    for (NVMTLSubmissionPart *part in cb->_parts) {
+        if (![part isKindOfClass:[NVMTLSubmissionPart class]]) continue;
+        for (NVMTLTexture *t in part->surfaces) {
+            NVMTLTexture *r = t; while (r->_parent) r = r->_parent;
+            if (!r->_surf || !r->_vramOn) continue;
+            const uint32_t sid = (uint32_t)IOSurfaceGetID(r->_surf);
+            BOOL dup = NO; for (unsigned i = 0; i < n; i++) if (seen[i] == sid) { dup = YES; break; }
+            if (dup) continue;
+            if (n < 16) seen[n++] = sid;
+            (void)nvmtl_vk_surface_read_wait(sid);
+        }
+    }
+}
 // A texture whose part has landed while its surface is still held, published by the holder that releases it last.
 // dirtied: the commit marked its VRAM newest, so publication is bookkeeping only (nvmtlSurfaceOutDirtied:).
 @interface NVMTLDeferredPublication : NSObject { @public NVMTLTexture *texture; BOOL dirtied; __weak NVMTLCommandBuffer *owner; } @end
@@ -192,7 +244,7 @@ static BOOL nvmtl_ws_publish_settled(NSArray *settled, NVMTLCommandBuffer *cb) {
 // at 90 frames a second.
 static void nvmtl_ws_mark_pending(NVMTLCommandBuffer *cb) {
     if (!nvmtl_ws_kernel_waits()) return;
-    NSMutableSet *ids = nil;
+    NSMutableSet *ids = nil, *reads = nil;
     for (NVMTLSubmissionPart *part in cb->_parts) {
         if (![part isKindOfClass:[NVMTLSubmissionPart class]]) continue;
         for (NVMTLTexture *t in part->surfaces) if (t->_surf) {
@@ -200,8 +252,34 @@ static void nvmtl_ws_mark_pending(NVMTLCommandBuffer *cb) {
             [ids addObject:@(IOSurfaceGetID(t->_surf))];
         }
     }
-    if (!ids) return;
+    if (nvmtl_ws_read_marks())
+        for (NVMTLSubmissionPart *part in cb->_parts) {
+            if (![part isKindOfClass:[NVMTLSubmissionPart class]]) continue;
+            for (id o in part->resources) {
+                if (![o isKindOfClass:[NVMTLTexture class]]) continue;
+                NVMTLTexture *r = o; while (r->_parent) r = r->_parent;
+                if (!r->_surf || !r->_vramOn) continue;
+                NSNumber *n = @(IOSurfaceGetID(r->_surf));
+                if ([ids containsObject:n]) continue;
+                if (!reads) reads = [NSMutableSet new];
+                [reads addObject:n];
+            }
+        }
+    if (!ids && !reads) return;
     NVMTLSurfaceHolds *holds = [NVMTLSurfaceHolds new];
+    holds->reads = reads;
+    if (reads) @synchronized (nvmtl_ws_lock()) {
+        if (!nvmtl_ws_read_holds) nvmtl_ws_read_holds = [NSCountedSet new];
+        for (NSNumber *n in reads) {
+            [nvmtl_ws_read_holds addObject:n];
+            if ([nvmtl_ws_read_holds countForObject:n] == 1) (void)nvmtl_vk_surface_read_mark(n.unsignedIntValue, 1);
+        }
+    }
+    if (!ids) {
+        holds->ids = [NSMutableSet new];
+        objc_setAssociatedObject(cb, nvmtl_ws_marks_key, holds, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return;
+    }
     holds->ids = ids; holds->early = nvmtl_ws_surface_wait();
     if (holds->early) {
         NSMutableSet *dirtied = [NSMutableSet new];
@@ -253,6 +331,7 @@ static void nvmtl_ws_mark_ready(NVMTLCommandBuffer *cb) {
     NSArray *ids; @synchronized (nvmtl_ws_lock()) { ids = holds->ids.allObjects; }
     NSMutableArray *settled = [NSMutableArray new];
     for (NSNumber *n in ids) nvmtl_ws_release(holds, n.unsignedIntValue, settled);
+    nvmtl_ws_read_release(holds->reads);
     objc_setAssociatedObject(cb, nvmtl_ws_marks_key, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     (void)nvmtl_ws_publish_settled(settled, nil);
 }
@@ -698,6 +777,8 @@ static void nvmtl_gsub_ahead_pass1(void) {
     // the commit's kernel marks can wait for the accelerator lock, so they go in outside the class lock (see
     // nvmtl_ws_mark_pending). This command buffer is committed and holds its queue reservation, but nothing submits it
     // (_commitMarking stops the submit-ahead pass) or completes it (it is not pending yet) before its marks are in.
+    // An application's writes to shared surfaces wait here, outside the class lock, for WindowServer's reads of them.
+    nvmtl_shared_read_wait(self);
     nvmtl_ws_mark_pending(self);
     @synchronized ([NVMTLCommandBuffer class]) {
         _commitMarking = NO;

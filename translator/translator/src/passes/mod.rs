@@ -308,6 +308,8 @@ struct Ctx {
     image_multisampled: HashSet<Word>,
     image_storage: HashSet<Word>,
     image_array_vars: HashMap<Word, (Word, (Dim, bool), ImageComp, bool)>,
+    // `array<sampler, N>` entry parameters, each lowered to a UniformConstant array of samplers
+    sampler_array_vars: HashSet<Word>,
     bindless_heap_vars: HashMap<Word, Word>,
     address_table: Option<(Word, Word, Option<Word>)>,
     bound_buffer_vars: HashSet<Word>,
@@ -396,6 +398,7 @@ impl Ctx {
             image_multisampled: HashSet::new(),
             image_storage: HashSet::new(),
             image_array_vars: HashMap::new(),
+            sampler_array_vars: HashSet::new(),
             bindless_heap_vars: HashMap::new(),
             address_table: None,
             bound_buffer_vars: HashSet::new(),
@@ -2799,9 +2802,11 @@ pub(crate) fn transform_with_options_and_sidecar(
     materialize_inlined_local_pointer_field_stores(&mut ctx, entry_idx);
     rewrite_return(&mut ctx, entry_idx, &stage, frag, vert, &input_defs)?;
     resources::materialize_texture_array_loads(&mut ctx, entry_idx);
+    resources::materialize_sampler_array_loads(&mut ctx, entry_idx);
     hoist_function_variables(&mut ctx, entry_idx);
     recover_inlined_local_pointer_fields(&mut ctx, entry_idx);
     resources::materialize_texture_array_loads(&mut ctx, entry_idx);
+    resources::materialize_sampler_array_loads(&mut ctx, entry_idx);
     neutralize_private_placeholder_access_chains(&mut ctx, entry_idx)?;
     resource_phi_fold::fold_constant_resource_phis(&mut ctx, entry_idx);
     propagate_sampler_state_aliases(&mut ctx, entry_idx);
@@ -2989,6 +2994,7 @@ pub(crate) fn transform_with_options_and_sidecar(
     materialize_selected_subgroup_results(&mut ctx);
 
     resources::sink_loop_header_texture_array_loads(&mut ctx, entry_idx);
+    resources::split_constant_descriptor_array_elements(&mut ctx, entry_idx);
     ctx.emit_sidecar.local_pointer_field_stores.clear();
     ctx.emit_sidecar.aggregate_pointer_values.clear();
     finalize(&mut ctx, entry_idx, &stage, frag, vert)?;

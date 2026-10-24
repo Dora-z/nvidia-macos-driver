@@ -19,7 +19,10 @@ with tempfile.TemporaryDirectory() as directory:
     subprocess.run(['cc', str(file), '-o', str(exe)], check=True)
     cases = [(None, None, '<unset>'), ('0', None, '<unset>'), ('0', 'otherRule', 'otherRule'),
              (None, 'otherRule', 'otherRule'), ('1', None, 'disableMetalOnNvidia'),
-             ('1', 'otherRule:disableMetalOnNvidia', 'otherRule:disableMetalOnNvidia')]
+             ('1', 'otherRule:disableMetalOnNvidia', 'otherRule:disableMetalOnNvidia'),
+             # a process list: this binary is "policy"; names match whole, with spaces around commas ignored
+             ('policy', None, 'disableMetalOnNvidia'), ('Claude Helper, policy', None, 'disableMetalOnNvidia'),
+             ('Claude Helper', None, '<unset>'), ('pol', None, '<unset>'), ('policy', 'otherRule', 'otherRule:disableMetalOnNvidia')]
     for opt, override, expected in cases:
         env = dict(os.environ)
         for key, value in [('NVMTL_ANGLE_METAL', opt), ('ANGLE_FEATURE_OVERRIDES_DISABLED', override)]:
@@ -28,4 +31,4 @@ with tempfile.TemporaryDirectory() as directory:
                 env[key] = value
         actual = subprocess.check_output([str(exe)], env=env, text=True).strip()
         assert actual == expected, (opt, override, actual, expected)
-print('ANGLE policy: off by default, on with NVMTL_ANGLE_METAL=1, existing overrides kept, in six cases.')
+print('ANGLE policy: off by default, on with NVMTL_ANGLE_METAL=1, a process list, existing overrides kept, in eleven cases.')

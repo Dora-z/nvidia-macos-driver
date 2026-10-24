@@ -10,6 +10,10 @@
 #define NVRM_SURFSHARE_VERSION 2u
 /* NVRM_ESC_SURF_DIRTY with this plane bit is a WindowServer completion mark (bit 0: 1 pending, 0 ready), not a dirty plane */
 #define NVRM_SS_PLANE_GPU_MARK 0x80000000u
+/* with NVRM_SS_PLANE_GPU_MARK (accelerators that publish NVAccelSurfaceReadMarks): bit 1 makes the mark a WindowServer
+ * read of the surface's shared VRAM (bit 0: 1 reading, 0 done); bit 2 waits until no such read is in flight (any process) */
+#define NVRM_SS_MARK_READ      0x2u
+#define NVRM_SS_MARK_READ_WAIT 0x4u
 /* NVRM_ESC_SURF_DIRTY with this plane bit gives up with NVRM_SS_BUSY instead of waiting for the accelerator lock
  * (accelerators that publish NVAccelSurfaceWait) */
 #define NVRM_SS_PLANE_TRYLOCK  0x40000000u

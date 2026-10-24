@@ -672,6 +672,12 @@ pub(in crate::passes) fn apply_bindings(
                 resource_values.insert(lid);
                 splices.push((pid, lid));
             }
+            ParamBinding::SamplerArray { var } => {
+                ctx.sampler_array_vars.insert(var);
+                remove_dead_local_image_array_memcpy(ctx, entry_idx, pid);
+                resource_values.insert(var);
+                splices.push((pid, var));
+            }
             ParamBinding::HeapImage {
                 slot,
                 image_ty,
