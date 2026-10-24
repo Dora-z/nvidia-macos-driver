@@ -2743,10 +2743,14 @@ static BOOL nvmtl_pixel_sampler_update(NSMutableDictionary *states, NSString *in
             }
         }
         NSData *key=_pixelSamplerKey;
+        // same pipeline, same sampler values as this encoder's last draw: its choice stands (no lock, no lookup; ANGLE
+        // binds every draw)
+        if (_svSel && _svFor==_ps && _svKey==key) return _svSel==[NSNull null] ? nil : _svSel;
+        _svFor=_ps; _svKey=key; _svSel=nil;
         @synchronized(_ps) {
             if(!_ps->_samplerVariants) _ps->_samplerVariants=[NSMutableDictionary new];
             id cached=_ps->_samplerVariants[key];
-            if(cached==[NSNull null]) return nil;
+            if(cached==[NSNull null]) { _svSel=cached; return nil; }
             selected=cached;
             if(!selected) {
                 // Reusing the key across pipelines still performs each pipeline's own variant lookup.
@@ -2765,12 +2769,13 @@ static BOOL nvmtl_pixel_sampler_update(NSMutableDictionary *states, NSString *in
                     if(!selected)why=error.description;
                     else nvmtl_sampvar_put(gk,selected,vf,ff);
                 }
-                if(!selected){nvlog("pixel sampler specialization REFUSED %s: %s",_ps->_fname.UTF8String,why.UTF8String);_ps->_samplerVariants[key]=[NSNull null];return nil;}
+                if(!selected){nvlog("pixel sampler specialization REFUSED %s: %s",_ps->_fname.UTF8String,why.UTF8String);_ps->_samplerVariants[key]=[NSNull null];_svSel=[NSNull null];return nil;}
                 _ps->_samplerVariants[key]=selected;
                 nvlog("pixel sampler variant built: %s / %s",_ps->_vname.UTF8String,_ps->_fname.UTF8String);
             }
         }
     }
+    _svSel=selected;
     return selected;
 }
 - (BOOL)nvmtlBindSamplerPipeline {
@@ -2942,8 +2947,10 @@ static BOOL nvmtl_pixel_sampler_update(NSMutableDictionary *states, NSString *in
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)ps {
     // NVMTL_DUMP_PSO=<text>: the first encoder that sets a pipeline whose label contains it has the fragment buffers bound
     // at its end dumped, as NVMTL_DUMP_GROUP does, for apps that label pipelines but push no debug groups (diagnostic)
+    // The same pipeline again inside a begun pass (Apple's GL renderer sets it before every draw) changes nothing.
+    if (ps && (NVMTLRenderPipelineState *)ps == _ps && _begun && !(_cb->_c.pt_open && _cb->_c.pt_pool)) return;
     { static const char *want; static int once; static _Atomic int armed; if (!once) { once = 1; want = getenv("NVMTL_DUMP_PSO"); }
-      NSString *lbl = ps.label;
+      NSString *lbl = want ? ps.label : nil;
       if (want && !strcmp(want, "?") && lbl) { static NSMutableSet *seen; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
           pthread_mutex_lock(&mu); if (!seen) seen = [NSMutableSet new]; BOOL n = ![seen containsObject:lbl]; if (n) [seen addObject:lbl];
           pthread_mutex_unlock(&mu); if (n) nvlog("NVMTL_DUMP_PSO: pipeline label %s", lbl.UTF8String); }
@@ -3249,6 +3256,7 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
     [self nvmtlBeginVisibility];
 }
 - (void)endEncoding {
+    _svFor=nil; _svKey=nil; _svSel=nil;   // nothing of this encoder outlives it
     _cb->_nEnd++;
     if (_dumpPso) { _dumpPso = NO; [self nvmtlDumpBoundFragmentBuffers]; }
     [self nvmtlCloseVisibility];
