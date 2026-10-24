@@ -6256,7 +6256,8 @@ int nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t r
     VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
         VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
-    pvkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toDst);
+    // after every earlier reader (see nvmtl_vk_image_write_host_async)
+    pvkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toDst);
     VkBufferImageCopy bic = { 0, (uint32_t)(row_bytes / bpp), 0, { nvmtl_copy_aspect(img), 0, 0, 1 }, { 0, 0, 0 }, { img->w, img->h, 1 } };
     pvkCmdCopyBufferToImage(c.cb, (VkBuffer)hb.buf, (VkImage)img->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
     VkImageMemoryBarrier toRead = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
@@ -6287,7 +6288,8 @@ int nvmtl_vk_image_write(nvk_queue *q, nvk_image *img, const void *src, size_t r
     VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
         VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
-    pvkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toDst);
+    // after every earlier reader (see nvmtl_vk_image_write_host_async)
+    pvkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toDst);
     VkBufferImageCopy bic = { 0, 0, 0, { nvmtl_copy_aspect(img), 0, 0, 1 }, { 0, 0, 0 }, { img->w, img->h, 1 } };
     pvkCmdCopyBufferToImage(c->cb, (VkBuffer)sl->buf.buf, (VkImage)img->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
     VkImageMemoryBarrier toRead = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
@@ -6404,7 +6406,9 @@ static int nvmtl_async_tex_upload(void)
     }
     return on;
 }
-typedef struct { nvmtl_inflight infl; nvk_buffer stage; nvk_cmdbuf cb; } nvmtl_asyncup;
+// release(ctx), when set, runs after the fence and the staging buffer: an async surface-in keeps its IOSurface locked
+// and retained until the copy engine has read the imported pages.
+typedef struct { nvmtl_inflight infl; nvk_buffer stage; nvk_cmdbuf cb; void (*release)(void *); void *ctx; } nvmtl_asyncup;
 static pthread_mutex_t g_asyncup_mutex = PTHREAD_MUTEX_INITIALIZER;
 // Atomically read and clear an image's pending async-upload handle (the consume/finish-first decision).
 static uint64_t nvmtl_asyncup_take(nvk_image *img)
@@ -6431,12 +6435,78 @@ static void nvmtl_asyncup_finish(uint64_t token)
 {
     if (!token) return;
     nvmtl_asyncup *au = (nvmtl_asyncup *)(uintptr_t)token;
+    // A handle is finished when its image is next uploaded or destroyed, which can be thousands of submissions later.
+    // By then its witness slot (one of NVMTL_WIT_SLOTS, reused in order) may hold a newer sequence: the verdict waited a
+    // second, leaked the pool, and eight of those turned pool reuse off for the whole process (seen once in WindowServer
+    // within three minutes). A handle that old is finished blind: its fence has long signalled, and its pool is destroyed
+    // instead of kept. One finished at the next frame, the common case, keeps its witness and its pool is reused.
+    const uint32_t ws = au->cb.wseq;
+    if (ws && ws < NVMTL_WSEQ_LOST && __atomic_load_n(&g_wit_seq, __ATOMIC_RELAXED) - ws >= NVMTL_WIT_SLOTS / 2)
+        au->cb.wseq = NVMTL_WSEQ_BLIND;
     nvmtl_vk_submit_finish(&au->infl);
     nvmtl_vk_buffer_destroy(&au->stage);
+    if (au->release) au->release(au->ctx);
     free(au);
 }
 // Public guard for the consumers (readback, surface-out, migration, destroy): finish a pending upload first.
 void nvmtl_vk_image_upload_barrier(nvk_image *img) { nvmtl_asyncup_finish(nvmtl_asyncup_take(img)); }
+
+// Asynchronous surface-in (NVMTL_ASYNC_SURFIN=1, default OFF). WindowServer re-uploads a client's IOSurface every time
+// its seed moves, from inside setFragmentTexture, and nvmtl_vk_image_write_host waited for the copy engine before
+// returning: in a window-drag spindump on a GTX 1660 SUPER that wait was 26% of the compositor thread (the import and
+// release ioctls another 23%), which held a 180 Hz panel at 36 frames per second. Here the imported pages are copied
+// with the same commands but the submission is left in flight on the image (the NVMTL_ASYNC_TEX_UPLOAD handle), and the
+// IOSurface stays locked and retained until it is finished. The draw that samples the image needs no wait: every
+// submission goes to the one queue, so queue order plus the TRANSFER->SHADER_READ barrier put the copy first. The next
+// surface-in, readback, migration or destroy of the image finishes it, as for a replaceRegion upload.
+int nvmtl_async_surfin(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("NVMTL_ASYNC_SURFIN");
+        on = e && e[0] == '1';
+        if (on) syslog(LOG_NOTICE, "NullMoth: async surface-in ON (NVMTL_ASYNC_SURFIN) in %s", getprogname());
+    }
+    return on;
+}
+int nvmtl_vk_image_write_host_async(nvk_queue *q, nvk_image *img, void *base, size_t row_bytes, size_t bytes,
+                                    void (*release)(void *), void *ctx)
+{
+    const size_t bpp = img->bpp ? img->bpp : 4;
+    if (img->bw > 1 || img->bh > 1 || !row_bytes || row_bytes % bpp || row_bytes < (size_t)img->w * bpp) return -1;
+    if (g_host_align) bytes = (bytes + g_host_align - 1) & ~(g_host_align - 1);
+    if ((size_t)img->h * row_bytes > bytes) return -1;
+    // the previous upload to this image must land before this one overwrites it, and gives back its own surface lock
+    nvmtl_asyncup_finish(nvmtl_asyncup_take(img));
+    nvmtl_asyncup *au = (nvmtl_asyncup *)calloc(1, sizeof *au);
+    if (!au) return -1;
+    if (nvmtl_vk_buffer_import_host(base, bytes, &au->stage)) { free(au); return -1; }
+    nvk_cmdbuf *const c = &au->cb;
+    if (nvmtl_vk_cmd_begin(q, c)) { nvmtl_vk_buffer_destroy(&au->stage); free(au); return -1; }
+    VkImageSubresourceRange range = { nvmtl_barrier_aspect(img), 0, 1, 0, 1 };
+    VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
+    // Wait for every earlier reader of this image (ALL_COMMANDS, not TOP_OF_PIPE): the copy overwrites the whole surface,
+    // and a frame submitted before it may still be sampling the old contents. From TOP_OF_PIPE the two overlapped, and
+    // a window composited meanwhile could show one of its two triangles black or white for a frame.
+    pvkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toDst);
+    VkBufferImageCopy bic = { 0, (uint32_t)(row_bytes / bpp), 0, { nvmtl_copy_aspect(img), 0, 0, 1 }, { 0, 0, 0 }, { img->w, img->h, 1 } };
+    pvkCmdCopyBufferToImage(c->cb, (VkBuffer)au->stage.buf, (VkImage)img->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
+    VkImageMemoryBarrier toRead = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
+    pvkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &toRead);
+    if (nvmtl_vk_submit_begin_at(c, &au->infl, "surface upload async (imported pages)")) {
+        // nothing reached the queue, or the device is gone: the pages are not read, so they can go now
+        nvmtl_vk_buffer_destroy(&au->stage); free(au); return -1;
+    }
+    img->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    au->release = release; au->ctx = ctx;
+    nvmtl_asyncup_store(img, (uint64_t)(uintptr_t)au);
+    return 0;
+}
 
 int nvmtl_vk_image_write_region_level(nvk_queue *q, nvk_image *img, const void *src, size_t row_bytes,
                                       uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t level)
