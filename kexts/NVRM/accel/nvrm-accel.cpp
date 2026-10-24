@@ -707,6 +707,8 @@ public:
             // accelerator that does not wait, that mark would let a CPU lock or a copied present read a surface before
             // its pixels landed, so the plugin keeps marking them after the GPU finishes.
             setProperty("NVAccelSurfaceWait", 1ULL, 32);
+            // WindowServer's reads of shared surface VRAM can be marked, and application writes wait for them (nvSurfReadWait)
+            setProperty("NVAccelSurfaceReadMarks", 1ULL, 32);
             registerService(); ALOG("registerService() called — Metal can now find MetalPluginName=%s", "NVMTLDriver");
             gAccel = this; gEnableAccel = &NVAccel::enableFromHook;
             for (unsigned i = 0; i < NV_CARRIERS; i++) {
@@ -1401,6 +1403,71 @@ static bool nvSurfWaitReady(unsigned int id)
     }
     return ready;
 }
+/*
+ * Reads of shared surface VRAM. WindowServer composites straight from an application's IOSurface VRAM (item 7), and
+ * the application draws its next frame into that surface as soon as CoreAnimation hands it back, which can be before
+ * WindowServer's GPU has finished reading it: a sticky header drawn last over scrolled content showed that content for
+ * a frame (Claude's title bar on a fast scroll, only with unmapped VRAM on). WindowServer marks the shared surfaces a
+ * command buffer samples when it commits and clears them when its GPU has finished; an application's commit that writes
+ * one of them waits here first. Kept apart from the write marks: swaps and page-offs never wait for a read.
+ */
+static int gSurfReadOn = 1;
+static SInt64 gCntReadMarks, gCntReadWaits, gCntReadTimeouts, gCntReadAsks;
+static int gSurfReadWaitMaxUs;
+static const unsigned kSurfReadWaitMs = 50;   // a composite that has not finished in 50 ms is hung; let the writer go
+static NVSurfPending gSurfRead[64];
+static unsigned int gSurfReadSeq;
+static void nvSurfReadMark(unsigned int id, bool reading)
+{
+    IOLock *l = nvSurfLock();
+    if (!l || !id) return;
+    IOLockLock(l);
+    unsigned slot = 64, oldest = 0;
+    for (unsigned i = 0; i < 64; i++) {
+        if (gSurfRead[i].id == id) { slot = i; break; }
+        if (slot == 64 && !gSurfRead[i].id) slot = i;
+        if (gSurfRead[i].seq < gSurfRead[oldest].seq) oldest = i;
+    }
+    if (reading) {
+        if (slot == 64) slot = oldest;
+        gSurfRead[slot].id = id; gSurfRead[slot].seq = ++gSurfReadSeq;
+    } else if (slot < 64 && gSurfRead[slot].id == id) {
+        gSurfRead[slot].id = 0;
+        IOLockWakeup(l, gSurfRead, false);
+    }
+    IOLockUnlock(l);
+    OSAddAtomic64(1, &gCntReadMarks);
+}
+static void nvSurfReadWait(unsigned int id)
+{
+    IOLock *l = gSurfPendLock;
+    if (!l || !id || !gSurfReadOn) return;
+    OSAddAtomic64(1, &gCntReadAsks);
+    uint64_t start = mach_absolute_time(), deadline = 0;
+    clock_interval_to_deadline(kSurfReadWaitMs, kMillisecondScale, &deadline);
+    bool waited = false, ready = true;
+    IOLockLock(l);
+    for (;;) {
+        unsigned i = 0;
+        while (i < 64 && gSurfRead[i].id != id) i++;
+        if (i == 64) break;
+        if (mach_absolute_time() >= deadline) { gSurfRead[i].id = 0; ready = false; break; }
+        waited = true;
+        IOLockSleepDeadline(l, gSurfRead, deadline, THREAD_UNINT);
+    }
+    IOLockUnlock(l);
+    if (waited) {
+        uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
+        if ((int)(ns / 1000) > gSurfReadWaitMaxUs) gSurfReadWaitMaxUs = (int)(ns / 1000);
+        OSAddAtomic64(1, ready ? &gCntReadWaits : &gCntReadTimeouts);
+    }
+}
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_surface_read_on, CTLFLAG_RW | CTLFLAG_LOCKED, &gSurfReadOn, 0, "1 = application writes to shared surface VRAM wait for WindowServer's reads of it");
+NVACCEL_CNT(nvaccel_surface_read_marks,    gCntReadMarks,    "read/done marks from WindowServer");
+NVACCEL_CNT(nvaccel_surface_read_asks,     gCntReadAsks,     "application writes that asked whether WindowServer was reading");
+NVACCEL_CNT(nvaccel_surface_read_waits,    gCntReadWaits,    "application writes that waited for a WindowServer read to finish");
+NVACCEL_CNT(nvaccel_surface_read_timeouts, gCntReadTimeouts, "application writes whose WindowServer read did not finish within 50 ms");
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_surface_read_wait_max_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gSurfReadWaitMaxUs, 0, "longest application wait for a WindowServer read, us");
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_surface_gpu, CTLFLAG_RD | CTLFLAG_LOCKED, &gSurfGpuOn, 0, "1 = WindowServer swaps wait for GPU completion here (same value as nvaccel_surface_gpu_on)");
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_surface_gpu_on, CTLFLAG_RW | CTLFLAG_LOCKED, &gSurfGpuOn, 0, "0 = WindowServer waits for its own composites again (the plugin re-asks every second)");
 NVACCEL_CNT(nvaccel_surface_gpu_marks,    gCntSurfMarks,    "pending/ready marks from WindowServer");
@@ -1456,6 +1523,9 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu);    sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu_on);
     sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu_marks); sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu_waits);
     sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu_timeouts); sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu_wait_max_us);
+    sysctl_register_oid(&sysctl__debug_nvaccel_surface_read_on);    sysctl_register_oid(&sysctl__debug_nvaccel_surface_read_marks);
+    sysctl_register_oid(&sysctl__debug_nvaccel_surface_read_asks);  sysctl_register_oid(&sysctl__debug_nvaccel_surface_read_waits);
+    sysctl_register_oid(&sysctl__debug_nvaccel_surface_read_timeouts); sysctl_register_oid(&sysctl__debug_nvaccel_surface_read_wait_max_us);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_async_refused); sysctl_register_oid(&sysctl__debug_nvaccel_iop_async_drop);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_late);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h0);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h1);
@@ -1655,12 +1725,23 @@ static bool nvAccelRestoreParkedForDirty(NVResource *res, NVVidMemory *vm, unsig
 }
 // The marks arrive through NVK's surface escape (NVRM_ESC_SURF_DIRTY with plane NVRM_SS_PLANE_GPU_MARK | pending): the
 // WindowServer sandbox denies sysctl writes. Only WindowServer's own marks are taken, so no other process can hold a swap.
+// A read wait (NVRM_SS_MARK_READ_WAIT) is any process's: it only holds the caller.
 static unsigned nvSurfGpuEscape(const struct NVRMSurfShareEsc *p)
 {
+    if (p->plane & NVRM_SS_MARK_READ_WAIT) {
+        if (!gSurfReadOn) return NVRM_SS_OFF;
+        nvSurfReadWait(p->surfaceID);
+        return 0;
+    }
     if (!gSurfGpuOn) return NVRM_SS_OFF;
     char nm[32] = { 0 };
     proc_selfname(nm, sizeof nm);
     if (strcmp(nm, "WindowServer")) return NVRM_SS_OFF;
+    if (p->plane & NVRM_SS_MARK_READ) {
+        if (!gSurfReadOn) return NVRM_SS_OFF;
+        if (p->surfaceID) nvSurfReadMark(p->surfaceID, (p->plane & 1u) != 0);
+        return 0;
+    }
     if (p->surfaceID) nvSurfMark(p->surfaceID, (p->plane & 1u) != 0);
     return 0;
 }

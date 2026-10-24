@@ -1923,17 +1923,33 @@ uint32_t nvmtl_vk_surface_gpu_mark(uint32_t surfaceID, int pending)
     if (!pnvk_surface_dirty || !g_dev) return 0x80000002u;
     return pnvk_surface_dirty(g_dev, surfaceID, 0x80000000u | (pending ? 1u : 0u));
 }
-/* 1 when NVAccel publishes NVAccelSurfaceWait: its page-off waits for a surface WindowServer's GPU is still writing */
-int nvmtl_vk_accel_surface_wait(void)
+static int nvmtl_vk_accel_flag(CFStringRef name)
 {
     io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVAccel"));
     if (!s) return 0;
-    CFTypeRef v = IORegistryEntryCreateCFProperty(s, CFSTR("NVAccelSurfaceWait"), kCFAllocatorDefault, 0);
+    CFTypeRef v = IORegistryEntryCreateCFProperty(s, name, kCFAllocatorDefault, 0);
     int on = 0;
     if (v && CFGetTypeID(v) == CFNumberGetTypeID()) CFNumberGetValue((CFNumberRef)v, kCFNumberIntType, &on);
     if (v) CFRelease(v);
     IOObjectRelease(s);
     return on == 1;
+}
+/* 1 when NVAccel publishes NVAccelSurfaceWait: its page-off waits for a surface WindowServer's GPU is still writing */
+int nvmtl_vk_accel_surface_wait(void) { return nvmtl_vk_accel_flag(CFSTR("NVAccelSurfaceWait")); }
+/* 1 when NVAccel publishes NVAccelSurfaceReadMarks: WindowServer's reads of shared surface VRAM can be marked, and an
+   application's write can wait for them (an older one would take a read mark for a write mark) */
+int nvmtl_vk_accel_read_marks(void) { return nvmtl_vk_accel_flag(CFSTR("NVAccelSurfaceReadMarks")); }
+/* WindowServer read mark (NVRM_SS_PLANE_GPU_MARK | NVRM_SS_MARK_READ): 0 = the kernel took it */
+uint32_t nvmtl_vk_surface_read_mark(uint32_t surfaceID, int reading)
+{
+    if (!pnvk_surface_dirty || !g_dev) return 0x80000002u;
+    return pnvk_surface_dirty(g_dev, surfaceID, 0x80000000u | 0x2u | (reading ? 1u : 0u));
+}
+/* waits in the kernel until no WindowServer read of the surface is in flight (NVRM_SS_MARK_READ_WAIT, at most 50 ms) */
+uint32_t nvmtl_vk_surface_read_wait(uint32_t surfaceID)
+{
+    if (!pnvk_surface_dirty || !g_dev) return 0x80000002u;
+    return pnvk_surface_dirty(g_dev, surfaceID, 0x80000000u | 0x4u);
 }
 int nvmtl_vk_surface_vram(uint32_t surfaceID, uint32_t plane, size_t need, nvk_buffer *out)
 {

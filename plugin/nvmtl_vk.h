@@ -364,3 +364,6 @@ int nvmtl_vk_surface_dirty(uint32_t surfaceID, uint32_t plane);
 int nvmtl_vk_surface_dirty_try(uint32_t surfaceID, uint32_t plane);
 uint32_t nvmtl_vk_surface_gpu_mark(uint32_t surfaceID, int pending);
 int nvmtl_vk_accel_surface_wait(void);
+int nvmtl_vk_accel_read_marks(void);
+uint32_t nvmtl_vk_surface_read_mark(uint32_t surfaceID, int reading);
+uint32_t nvmtl_vk_surface_read_wait(uint32_t surfaceID);
