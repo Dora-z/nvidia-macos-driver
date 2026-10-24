@@ -81,7 +81,10 @@ public:
     void              *fParkHandle = nullptr;
     void              *fParkKva    = nullptr;
     unsigned long long fParkPhys = 0, fParkBytes = 0, fParkCookie = 0;
-    void releaseVram(void *handle, void *kva, unsigned long long bytes, unsigned long long cookie);
+    // VRAM the framebuffer granted with no BAR1 mapping (NVRM_VRAM_FLAG_UNMAPPED): fKva and fPhys are 0, and only the
+    // RM handle reaches it (zero-copy share, flips, copy-engine page-off)
+    bool fUnmapped = false, fParkUnmapped = false;
+    void releaseVram(void *handle, void *kva, unsigned long long bytes, unsigned long long cookie, bool unmapped);
     void releaseParked();
 
     bool allocPhysical() APPLE_KEXT_OVERRIDE;
@@ -90,6 +93,7 @@ public:
 
     uint64_t getPhysicalSegment(unsigned long long a0, unsigned long long* a1) APPLE_KEXT_OVERRIDE {
         const unsigned long long total = *(const volatile unsigned long long *)((const unsigned char *)this + 0x40);
+        if (fUnmapped) nvAccelVmUnmappedTouch(0);   // no physical address to give: counted, in case the family asks
         if (!fPhys || a0 >= total) { if (a1) *a1 = 0; return 0; }
         if (a1) *a1 = total - a0;
         return fPhys + a0;
