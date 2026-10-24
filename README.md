@@ -1,5 +1,7 @@
 # NullMoth NVIDIA Driver for macOS
 
+> **Unofficial fork.** Changes here were written with an AI assistant and are not part of NullMoth. See [FORK.md](FORK.md).
+
 A Metal driver for NVIDIA GeForce cards on macOS 15 Sequoia (Intel Macs and OpenCore PCs). It is open source; the
 kernel extensions, the Metal plugin and the shader translator are in this repository. The 1401 app that installs it
 (Mac and Windows) is its own project: [1401](https://github.com/nullmoth/1401).
