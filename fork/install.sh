@@ -4,10 +4,11 @@
 #   1. test-builds the Auxiliary Kernel Collection with the two kexts (nothing changes if that fails)
 #   2. backs up what it replaces to ~/nullmoth-fork-backup-<date> (with a restore.sh)
 #   3. installs, publishes the new kernel collection; restart afterwards
-# build-dir: the output of fork/build.sh (default fork/out).
+# build-dir: the output of fork/build.sh (default: out/ next to this script, which is fork/out in the repository and
+# out/ in a release download).
 set -uo pipefail
 die() { echo "STOP: $*" >&2; exit 1; }
-REPO=$(cd "$(dirname "$0")/.." && pwd); IN=${1:-$REPO/fork/out}; U=${SUDO_USER:-$(stat -f %Su /dev/console)}
+HERE=$(cd "$(dirname "$0")" && pwd); IN=${1:-$HERE/out}; U=${SUDO_USER:-$(stat -f %Su /dev/console)}
 EXT=/Library/Extensions; KC=/Library/KernelCollections/AuxiliaryKernelExtensions.kc
 KB=/System/Library/KernelCollections/BootKernelExtensions.kc; KS=/System/Library/KernelCollections/SystemKernelExtensions.kc
 K=/System/Library/Kernels/kernel; KARG=(--allow-missing-kdk); [ -f "$K" ] && KARG+=(--kernel "$K")
@@ -17,7 +18,7 @@ KEXTS="NVRM NVAccel NVRMFB NVRMAGDC"
 [ "$(id -u)" = 0 ] || die "run with sudo"
 [ "$(sw_vers -productVersion | cut -d. -f1)" = 15 ] || die "this fork is built and tested on macOS 15 only"
 for f in NVAccel.kext/Contents/MacOS/NVAccel NVRMFB.kext/Contents/MacOS/NVRMFB NVMTLDriver libnvmtl_translate.dylib; do
-  [ -f "$IN/$f" ] || die "$IN/$f missing: run fork/build.sh first"
+  [ -f "$IN/$f" ] || die "$IN/$f missing: run fork/build.sh first, or use a release download"
 done
 codesign -v "$IN/NVMTLDriver" 2>/dev/null && codesign -v "$IN/libnvmtl_translate.dylib" 2>/dev/null || die "plugin or translator not signed"
 for k in $KEXTS; do [ -d "$EXT/$k.kext" ] || die "$k.kext missing: install NullMoth 2.5.3 or 2.5.4 with 1401 first"; done
@@ -30,6 +31,8 @@ T=$(mktemp -d /var/tmp/nullmoth-fork.XXXX) || die "temp dir"
 mkdir -p "$T/repo" && for x in "$EXT"/*.kext; do ditto "$x" "$T/repo/$(basename "$x")" || die "stage $x"; done
 cp "$IN/NVAccel.kext/Contents/MacOS/NVAccel" "$T/repo/NVAccel.kext/Contents/MacOS/NVAccel" \
   && cp "$IN/NVRMFB.kext/Contents/MacOS/NVRMFB" "$T/repo/NVRMFB.kext/Contents/MacOS/NVRMFB" || die "stage binaries"
+# a download carries com.apple.quarantine; nothing installed keeps it
+xattr -cr "$T/repo/NVAccel.kext" "$T/repo/NVRMFB.kext" 2>/dev/null
 chown -R root:wheel "$T/repo" && chmod -R go-w "$T/repo" || die "stage permissions"
 kmutil create -n aux --volume-root / "${KARG[@]}" -B $KB -S $KS --repository "$T/repo" -A "$T/aux.kc" -z >"$T/kmutil.log" 2>&1 \
   || { tail -20 "$T/kmutil.log"; die "test kernel collection build failed; nothing changed"; }
@@ -42,13 +45,13 @@ echo "2. back up -> $BK"
 mkdir -p "$BK" && ditto "$EXT/NVAccel.kext" "$BK/NVAccel.kext" && ditto "$EXT/NVRMFB.kext" "$BK/NVRMFB.kext" \
   && cp -p "$KC" "$BK/AuxiliaryKernelExtensions.kc" && cp -p "$GB/NVMTLDriver" "$BK/NVMTLDriver" \
   && cp -p "$GB/libnvmtl_translate.dylib" "$BK/libnvmtl_translate.dylib" && { [ ! -f "$CONF" ] || cp -p "$CONF" "$BK/nvrm610.conf"; } \
-  && cp "$REPO/fork/restore.sh" "$BK/restore.sh" || die "backup failed; nothing changed"
+  && cp "$HERE/restore.sh" "$BK/restore.sh" || die "backup failed; nothing changed"
 chown -R "$U" "$BK"
 
 echo "3. install"
 for b in "NVAccel:$IN/NVAccel.kext/Contents/MacOS/NVAccel" "NVRMFB:$IN/NVRMFB.kext/Contents/MacOS/NVRMFB"; do
   k=${b%%:*}; src=${b#*:}; dst="$EXT/$k.kext/Contents/MacOS/$k"
-  cp "$src" "$dst" && chown root:wheel "$dst" && chmod 755 "$dst" || die "copy $k failed: sudo bash '$BK/restore.sh'"
+  cp "$src" "$dst" && xattr -c "$dst" && chown root:wheel "$dst" && chmod 755 "$dst" || die "copy $k failed: sudo bash '$BK/restore.sh'"
 done
 NEWKC="$KC.fork-new"; rm -f "$NEWKC"
 kmutil create -n aux --volume-root / "${KARG[@]}" -B $KB -S $KS --repository "$EXT" -A "$NEWKC" -z >"$T/kmutil2.log" 2>&1 \
@@ -58,7 +61,7 @@ for k in $KEXTS; do printf '%s\n' "$INS" | grep -Fq "com.nullmoth.$k" || die "co
 mv -f "$NEWKC" "$KC" || die "cannot publish the collection: sudo bash '$BK/restore.sh'"
 # user-space files are replaced by rename: running apps and WindowServer keep the old file mapped
 for f in NVMTLDriver libnvmtl_translate.dylib; do
-  cp "$IN/$f" "$GB/$f.new.$$" && chown root:wheel "$GB/$f.new.$$" && chmod 755 "$GB/$f.new.$$" && mv -f "$GB/$f.new.$$" "$GB/$f" \
+  cp "$IN/$f" "$GB/$f.new.$$" && xattr -c "$GB/$f.new.$$" && chown root:wheel "$GB/$f.new.$$" && chmod 755 "$GB/$f.new.$$" && mv -f "$GB/$f.new.$$" "$GB/$f" \
     || { rm -f "$GB/$f.new.$$"; die "install $f failed: sudo bash '$BK/restore.sh'"; }
 done
 rm -rf "$T"

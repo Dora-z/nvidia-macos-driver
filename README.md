@@ -93,10 +93,24 @@ Electron 应用（如 Claude、VS Code）里的终端用 xterm.js 的 WebGL 渲�
 ### 前提
 
 - 已经用 [1401](https://github.com/nullmoth/1401) 装好官方 **NullMoth 2.5.3 或 2.5.4**，并且能正常进入桌面；
-- macOS 15 Sequoia，Intel / x86_64（macOS 26 未构建、未测试，安装脚本会拒绝）；
-- Xcode 命令行工具（`xcode-select --install`）；
-- Rust（[rustup](https://rustup.rs)），用于构建着色器翻译器；
-- 两个源码依赖：
+- macOS 15 Sequoia，Intel / x86_64（macOS 26 未构建、未测试，安装脚本会拒绝）。
+
+### 1. 安装
+
+#### 方式一：下载预编译版本（推荐）
+
+1. 在 [Releases](https://github.com/Dora-z/nvidia-macos-driver/releases) 下载最新的 `nullmoth-fork-*.zip`，双击解压。
+2. 打开“终端”，进入解压出来的文件夹（可以输入 `cd ` 后把文件夹拖进终端窗口），运行：
+
+```bash
+sudo bash install.sh
+```
+
+文件夹里的 `SHA256SUMS.txt` 是各文件的校验值，可以用 `shasum -a 256 -c SHA256SUMS.txt` 核对。
+
+#### 方式二：自己编译
+
+需要 Xcode 命令行工具（`xcode-select --install`）、Rust（[rustup](https://rustup.rs)）和两个源码依赖：
 
 ```bash
 git clone --depth 1 --branch 615.78.08 https://github.com/NVIDIA/open-gpu-kernel-modules.git ~/ogkm
@@ -106,7 +120,7 @@ git clone --depth 1 --branch 615.78.08 https://github.com/NVIDIA/open-gpu-kernel
 git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git ~/vulkan-headers
 ```
 
-### 1. 构建
+然后：
 
 ```bash
 git clone https://github.com/Dora-z/nvidia-macos-driver.git && cd nvidia-macos-driver
@@ -116,15 +130,13 @@ git clone https://github.com/Dora-z/nvidia-macos-driver.git && cd nvidia-macos-d
 OGKM=~/ogkm VKH=~/vulkan-headers bash fork/build.sh
 ```
 
-产物在 `fork/out/`：`NVAccel.kext`、`NVRMFB.kext`、`NVMTLDriver`（Metal 插件）、`libnvmtl_translate.dylib`（着色器翻译器）。
-
-### 2. 安装
-
 ```bash
 sudo bash fork/install.sh
 ```
 
-脚本会：
+编译产物在 `fork/out/`：`NVAccel.kext`、`NVRMFB.kext`、`NVMTLDriver`（Metal 插件）、`libnvmtl_translate.dylib`（着色器翻译器）。
+
+#### 安装脚本做了什么
 
 1. 先用新的 NVAccel / NVRMFB 试建一次内核扩展集合（失败则什么都不改）；
 2. 把要替换的文件（两个 kext、内核扩展集合、插件、翻译器、`nvrm610.conf`）备份到 `~/nullmoth-fork-backup-日期/`；
@@ -132,13 +144,13 @@ sudo bash fork/install.sh
 
 完成后**重启**（注销不会重启 WindowServer）。驱动的其它部分（NVRM、NVRMAGDC、NVK 等）保持官方原样。
 
-### 3. 打开可选功能
+### 2. 打开可选功能
 
 **HiDPI 高刷新率**：在开机参数里加 `nvfbscalehz=<你的刷新率>`（例如 `nvfbscalehz=180`），同时保留官方的
 `nvfbhidpi=1`。OpenCore 用户在 `config.plist` 的 `NVRAM → Add → 7C436110-AB2A-4BBB-A880-FE41995C9F82 → boot-args`
 里添加，然后重启，在“系统设置 → 显示器”里选 HiDPI 分辨率和刷新率。
 
-**插件开关**用 `fork/conf.sh` 写入 `/Library/GPUBundles/nvmtl/nvrm610.conf`：
+**插件开关**用 `conf.sh`（仓库里是 `fork/conf.sh`，下载包里在文件夹根目录）写入 `/Library/GPUBundles/nvmtl/nvrm610.conf`：
 
 ```bash
 sudo bash fork/conf.sh NVMTL_ASYNC_SURFIN 1
@@ -166,7 +178,7 @@ sudo bash fork/conf.sh NVMTL_ANGLE_METAL "Claude Helper"
 ps -axww -o args= | grep -- '--type=gpu-process' | grep -v grep | sed -E 's/ --type=gpu-process.*//'
 ```
 
-### 4. 确认生效
+### 3. 确认生效
 
 ```bash
 sysctl debug.nvrmfb_vram_unmapped debug.nvrmfb_vram_unmapped_grants debug.nvrmfb_vram_unmapped_refused
@@ -180,7 +192,7 @@ sysctl debug.nvaccel_surface_read_asks debug.nvaccel_surface_read_waits debug.nv
 - `nvaccel_surface_read_asks` 在使用 GPU 渲染的应用里增长：读取标记在工作，`_waits` 是实际等待的次数，
   `_timeouts` 应该很少。
 
-### 5. 恢复原版
+### 4. 恢复原版
 
 ```bash
 sudo bash ~/nullmoth-fork-backup-<日期>/restore.sh
