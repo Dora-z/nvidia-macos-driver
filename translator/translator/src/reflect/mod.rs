@@ -2221,7 +2221,7 @@ impl ShaderReflection {
                     static_sampler: None,
                 },
                 FragRole::Texture(n) => texture_binding(*n, Some(idx), &meta.texture_type_names),
-                FragRole::Sampler(n) => sampler_binding(*n, Some(idx)),
+                FragRole::Sampler(n) => sampler_array_binding(*n, Some(idx), meta.declared_descriptor_count(idx)),
                 FragRole::AccelerationStructureShadow(n) => ResourceBinding {
                     kind: ResourceKind::AccelerationStructureShadow,
                     metal_index: *n,
@@ -2423,7 +2423,7 @@ impl ShaderReflection {
                     static_sampler: None,
                 },
                 VertRole::Texture(n) => texture_binding(*n, Some(idx), &meta.texture_type_names),
-                VertRole::Sampler(n) => sampler_binding(*n, Some(idx)),
+                VertRole::Sampler(n) => sampler_array_binding(*n, Some(idx), meta.declared_descriptor_count(idx)),
                 VertRole::AccelerationStructureShadow(n) => ResourceBinding {
                     kind: ResourceKind::AccelerationStructureShadow,
                     metal_index: *n,
@@ -2620,7 +2620,7 @@ impl ShaderReflection {
                     }
                 }
                 KernRole::Texture(n) => texture_binding(*n, Some(idx), &meta.texture_type_names),
-                KernRole::Sampler(n) => sampler_binding(*n, Some(idx)),
+                KernRole::Sampler(n) => sampler_array_binding(*n, Some(idx), meta.declared_descriptor_count(idx)),
                 KernRole::StageInput(location) => {
                     let metal_index = stage_input_bindings
                         .get(&idx)
@@ -3228,6 +3228,16 @@ fn embedded_argument_fields(arguments: &[crate::meta::EmbeddedArgument]) -> Vec<
             resource_buffer_index: argument.resource_buffer_index,
         })
         .collect()
+}
+
+/// A sampler parameter; `array<sampler, N>` (AIR declares the count when N > 1) spans N consecutive sampler slots, and
+/// the descriptor count tells the driver to fill all of them, as a texture array's does.
+fn sampler_array_binding(n: u32, param_index: Option<u32>, declared: Option<u32>) -> ResourceBinding {
+    let mut binding = sampler_binding(n, param_index);
+    if let (Some(count), Some(descriptor)) = (declared, binding.descriptor.as_mut()) {
+        descriptor.count = count;
+    }
+    binding
 }
 
 fn sampler_binding(n: u32, param_index: Option<u32>) -> ResourceBinding {

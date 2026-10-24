@@ -2054,17 +2054,47 @@ static int nvmtl_spirv_bmask(const void *p, size_t n, uint64_t out[4])
         if (op == 71 && wc == 4 && w[i + 2] == 34 && w[i + 3] == 2 && w[i + 1] < bound) heap[w[i + 1]] = 1;
         i += wc;
     }
+    // A texture or sampler array (array<texture2d, N> / array<sampler, N>) is one variable at the binding of its first
+    // slot whose elements are the next N-1 slots: every one of them is used. Counting only the first left the rest
+    // unwritten, so element 1 and up read whatever an earlier draw left there.
+    uint32_t *len = (uint32_t *)calloc(bound, sizeof *len);   // variable id -> descriptor count
+    uint32_t *aux = (uint32_t *)calloc(bound, sizeof *aux);   // pointer -> pointee, array -> length id, constant -> value
+    if (!len || !aux) { free(len); free(aux); free(heap); return 0; }
+    for (size_t i = 5; i < nw; ) {
+        uint32_t wc = w[i] >> 16, op = w[i] & 0xffffu;
+        if (op == 32 && wc == 4 && w[i + 1] < bound) aux[w[i + 1]] = w[i + 3];                  // OpTypePointer
+        else if (op == 28 && wc == 4 && w[i + 1] < bound) aux[w[i + 1]] = w[i + 3];             // OpTypeArray
+        else if (op == 43 && wc == 4 && w[i + 2] < bound) aux[w[i + 2]] = w[i + 3];             // OpConstant (32-bit)
+        else if (op == 59 && wc >= 4 && w[i + 2] < bound && w[i + 1] < bound) {                 // OpVariable
+            const uint32_t pointee = aux[w[i + 1]];
+            len[w[i + 2]] = pointee && pointee < bound ? pointee : 0;                           // resolved below
+        }
+        i += wc;
+    }
+    for (size_t i = 5; i < nw; ) {                                                              // array types by opcode
+        uint32_t wc = w[i] >> 16, op = w[i] & 0xffffu;
+        if (op == 28 && wc == 4 && w[i + 1] < bound) {
+            const uint32_t n = w[i + 3] < bound ? aux[w[i + 3]] : 0;
+            for (uint32_t v = 0; v < bound; v++) if (len[v] == w[i + 1]) len[v] = n ? n | 0x80000000u : 1u;
+        }
+        i += wc;
+    }
     int ok = 1;
     for (size_t i = 5; i < nw; ) {
         uint32_t wc = w[i] >> 16, op = w[i] & 0xffffu;
         if (op == 71 && wc == 4 && w[i + 2] == 33 && !(w[i + 1] < bound && heap[w[i + 1]])) {
-            uint32_t b = w[i + 3];
-            if (b == NVMTL_ADDRESS_BINDING_NUMBER) out[NVMTL_ADDRESS_BINDING >> 6] |= 1ull << (NVMTL_ADDRESS_BINDING & 63);
-            else if (b < NVMTL_ADDRESS_BINDING) out[b >> 6] |= 1ull << (b & 63);
-            else if (!(b >= NVMTL_STEX_BINDING_NUMBER && b < NVMTL_STEX_BINDING_NUMBER + NVMTL_NSTEX)) { ok = 0; break; }
+            const uint32_t b0 = w[i + 3], id = w[i + 1];
+            const uint32_t count = id < bound && (len[id] & 0x80000000u) ? len[id] & 0xffffu : 1u;
+            for (uint32_t b = b0; b < b0 + count; b++) {
+                if (b == NVMTL_ADDRESS_BINDING_NUMBER) out[NVMTL_ADDRESS_BINDING >> 6] |= 1ull << (NVMTL_ADDRESS_BINDING & 63);
+                else if (b < NVMTL_ADDRESS_BINDING) out[b >> 6] |= 1ull << (b & 63);
+                else if (!(b >= NVMTL_STEX_BINDING_NUMBER && b < NVMTL_STEX_BINDING_NUMBER + NVMTL_NSTEX)) { ok = 0; break; }
+            }
+            if (!ok) break;
         }
         i += wc;
     }
+    free(len); free(aux);
     free(heap);
     return ok;
 }

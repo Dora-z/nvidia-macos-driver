@@ -220,6 +220,7 @@ pub(in crate::passes) enum ParamBinding {
         var: Word,
         specialized_state: Option<StaticSamplerState>,
     },
+    SamplerArray { var: Word },
     Buffer { var: Word, wrap: BufWrap },
     StageInput {
         var: Word,
@@ -231,6 +232,38 @@ pub(in crate::passes) enum ParamBinding {
     Value { val: Word },
     ZeroValue { val: Word },
     ZeroPointer { var: Word },
+}
+
+/// The element count of an `array<sampler, N>` entry parameter: the descriptor count AIR declares for it (stated only
+/// when N > 1), or 1 for a parameter whose pointee is a one-element array; None for a plain sampler.
+fn sampler_array_length(
+    stage: &Stage,
+    frag: Option<&FragMeta>,
+    vert: Option<&VertMeta>,
+    kern: Option<&KernMeta>,
+    idx: u32,
+    defs: &HashMap<Word, Instruction>,
+    pty: Word,
+) -> Option<u32> {
+    let declared = match stage {
+        Stage::Fragment => frag.and_then(|meta| meta.declared_descriptor_count(idx)),
+        Stage::Vertex => vert.and_then(|meta| meta.declared_descriptor_count(idx)),
+        Stage::Kernel => kern.and_then(|meta| meta.declared_descriptor_count(idx)),
+    };
+    if declared.is_some() {
+        return declared;
+    }
+    let pointee = defs.get(&ptr_pointee(defs, pty)?)?;
+    if pointee.class.opcode != Op::TypeArray {
+        return None;
+    }
+    let Some(Operand::IdRef(length)) = pointee.operands.get(1) else {
+        return None;
+    };
+    match defs.get(length)?.operands.first() {
+        Some(Operand::LiteralBit32(1)) => Some(1),
+        _ => None,
+    }
 }
 
 fn declared_descriptor_counts(
@@ -265,11 +298,9 @@ fn declared_descriptor_counts(
             ),
         };
         if is_sampler {
-            return Err(format!(
-                "entry parameter {idx} is an array of {count} samplers, which this translator has \
-                 no descriptor-array lowering for; emitting the module would sample with a \
-                 synthesized default sampler instead of the one the shader selected"
-            ));
+            // a sampler array lowers to a descriptor array over consecutive sampler slots (the sampler branch of
+            // build_stage_input checks the last slot stays inside the sampler band)
+            continue;
         }
         let texture_type_name = match stage {
             Stage::Fragment => frag.and_then(|m| m.texture_type_name(idx)),
@@ -864,6 +895,48 @@ pub(super) fn build_stage_input(
                     param_ty: *pty,
                 },
             ));
+        } else if let Some(count) = role_is("sampler")
+            .then(|| sampler_array_length(stage, frag, vert, kern, idx, &defs, *pty))
+            .flatten()
+        {
+            // array<sampler, N> [[sampler(k)]] (ANGLE's form of a GLSL sampler array): one descriptor array over
+            // sampler slots k..k+N-1, the same shape a texture array takes over texture slots
+            let metal_index = match stage {
+                Stage::Fragment => frag.and_then(|meta| match meta.role_of(idx) {
+                    Some(FragRole::Sampler(index)) => Some(*index),
+                    _ => None,
+                }),
+                Stage::Vertex => vert.and_then(|meta| match meta.role_of(idx) {
+                    Some(VertRole::Sampler(index)) => Some(*index),
+                    _ => None,
+                }),
+                Stage::Kernel => kern.and_then(|meta| match meta.role_of(idx) {
+                    Some(KernRole::Sampler(index)) => Some(*index),
+                    _ => None,
+                }),
+            }
+            .ok_or_else(|| format!("sampler array parameter {pid} has no Metal sampler index"))?;
+            sampler_resource_binding(descriptor_layout, metal_index + count - 1).map_err(|_| {
+                format!(
+                    "entry parameter {idx} is an array of {count} samplers from slot {metal_index}, past the \
+                     {} sampler slots of the descriptor ABI",
+                    crate::reflect::SAMPLER_ARGUMENT_COUNT
+                )
+            })?;
+            let sty = ctx.ty_sampler();
+            let array_ty = ctx.ty_array(sty, count);
+            let pptr = ctx.ty_ptr(StorageClass::UniformConstant, array_ty);
+            let var = ctx.module.fresh_id();
+            ctx.new_globals.push(Instruction::new(
+                Op::Variable,
+                Some(pptr),
+                Some(var),
+                vec![Operand::StorageClass(StorageClass::UniformConstant)],
+            ));
+            let binding = required_resource_binding(*pid, resource_binding)?;
+            decorate_binding(&mut ctx.module, var, descriptor_layout.set, binding);
+            ctx.interface_buffer_var(var);
+            bindings.push((*pid, ParamBinding::SamplerArray { var }));
         } else if role_is("sampler") {
             let sty = ctx.ty_sampler();
             let pptr = ctx.ty_ptr(StorageClass::UniformConstant, sty);
