@@ -261,7 +261,9 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     NvU16 fEdidMmW = 0, fEdidMmH = 0;
     bool fModeSet = false;
     unsigned fHomePure = 0;
-    IODetailedTimingInformationV2 fDT[128]; unsigned fNDT = 0;
+    // kMacTimings of fDT may hold macOS's timings (64 unless nvfbscalehz is set); the rest is for addKmsRefreshModes
+    enum { kMacTimings = 224 };
+    IODetailedTimingInformationV2 fDT[256]; unsigned fNDT = 0;
     IODisplayModeID fCurId = 1;
     struct NvKmsKapiDisplayMode fBootMode = {};
     NvU32 fBootW = 0, fBootH = 0, fBootPitch = 0;
@@ -2953,6 +2955,15 @@ IOReturn NVRMNVDAFramebuffer::validateDetailedTiming(void *description, IOByteCo
     }
     return kIOReturnSuccess;
 }
+// The order setDetailedTimings keeps macOS's timings in under nvfbscalehz=<hz>: 0 unscaled, 1 a scaled desktop at
+// that refresh rate, 2 any other scaled desktop.
+static unsigned nvrmMacTimingClass(const IODetailedTimingInformationV2 *d, uint32_t hz)
+{
+    if (!d->horizontalScaled || !d->verticalScaled) return 0;
+    const UInt64 tot = (UInt64)(d->horizontalActive + d->horizontalBlanking) * (d->verticalActive + d->verticalBlanking);
+    const UInt64 dhz = tot ? (d->pixelClock + tot / 2) / tot : 0;
+    return dhz + 1 >= hz && dhz <= hz + 1 ? 1 : 2;
+}
 IOReturn NVRMNVDAFramebuffer::setDetailedTimings(OSArray *array)
 {
     if (!array) {
@@ -2960,12 +2971,26 @@ IOReturn NVRMNVDAFramebuffer::setDetailedTimings(OSArray *array)
         if (fCurId != kModeId) FBLOG("setDetailedTimings(NULL) while 0x%x is on the head -- it stays until the next setDisplayMode", (unsigned)fCurId);
         return kIOReturnSuccess;
     }
-    unsigned n = 0, bad = 0;
-    for (unsigned i = 0; i < array->getCount() && n < 64; i++) {  // 64 from macOS; the rest of fDT is for addKmsRefreshModes
-        OSData *data = OSDynamicCast(OSData, array->getObject(i));
-        if (!data || data->getLength() < sizeof(IODetailedTimingInformationV2)) { bad++; continue; }
-        nvu_copy(&fDT[n++], data->getBytesNoCopy(), sizeof(IODetailedTimingInformationV2));
-    }
+    // macOS offers a scaled (HiDPI) desktop for every scale-resolutions entry at every refresh rate of the native raster,
+    // the 60 Hz ones first: 536 timings for a 1080p 60/144/180/200 Hz panel with a long override list, whose first 180 Hz
+    // desktop is entry 307. Keeping the first 64 dropped every desktop on a faster rate, so HiDPI stayed at 60 Hz while the
+    // native raster ran at 180 Hz. nvfbscalehz=<hz> (opt-in) keeps the unscaled timings first, then the scaled desktops at
+    // that rate, then the rest in macOS's order, up to kMacTimings. Without it the first 64 are kept, as before.
+    uint32_t scaleHz = 0;
+    if (!PE_parse_boot_argn("nvfbscalehz", &scaleHz, sizeof scaleHz)) scaleHz = 0;
+    const unsigned count = array->getCount(), limit = scaleHz ? (unsigned)kMacTimings : 64u;
+    unsigned n = 0, bad = 0, atHz = 0;
+    for (unsigned pass = scaleHz ? 0 : 2; pass < 3; pass++)
+        for (unsigned i = 0; i < count && n < limit; i++) {
+            OSData *data = OSDynamicCast(OSData, array->getObject(i));
+            if (!data || data->getLength() < sizeof(IODetailedTimingInformationV2)) { if (pass == 2) bad++; continue; }
+            const IODetailedTimingInformationV2 *d = (const IODetailedTimingInformationV2 *)data->getBytesNoCopy();
+            if (scaleHz && nvrmMacTimingClass(d, scaleHz) != pass) continue;
+            if (pass == 1) atHz++;
+            nvu_copy(&fDT[n++], d, sizeof *d);
+        }
+    if (scaleHz)
+        FBLOG("fb%u nvfbscalehz=%u: kept %u of %u macOS timings, %u of them scaled desktops at %u Hz", fIndex, scaleHz, n, count, atHz, scaleHz);
     const unsigned fromMac = n;
     n = addKmsRefreshModes(n);
     fNDT = n;
