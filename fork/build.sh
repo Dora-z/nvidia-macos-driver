@@ -57,11 +57,17 @@ echo "4/4 shader translator (libnvmtl_translate.dylib)"
 command -v cargo >/dev/null || die "cargo not found (install Rust with rustup)"
 # a copy of translator/ so cargo's lock file and target folder never touch the checkout
 T="$OUT/translator-src"; rm -rf "$T"; mkdir -p "$T" && cp -R "$REPO/translator/." "$T/" && rm -rf "$T"/*/target
+# source paths remapped as upstream's release build does, so the dylib names no folder of this Mac
+CH=${CARGO_HOME:-$HOME/.cargo}
+# (CARGO_ENCODED_RUSTFLAGS, separated by 0x1f: the paths may hold spaces, which RUSTFLAGS would split)
+CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=$T=/src"$'\x1f'"--remap-path-prefix=$CH=/cargo"$'\x1f'"--remap-path-prefix=$HOME=/build" \
 cargo build --release --manifest-path "$T/wrapper/Cargo.toml" --target-dir "$OUT/cargo-target" >"$OUT/translator.log" 2>&1 \
   || { grep -A6 '^error' "$OUT/translator.log" | head -30; die "translator did not build"; }
 D="$OUT/libnvmtl_translate.dylib"
 cp "$OUT/cargo-target/release/libnvmtl_translate.dylib" "$D" && strip -S "$D" \
   && install_name_tool -id @rpath/libnvmtl_translate.dylib "$D" 2>/dev/null && codesign -f -s - "$D" 2>/dev/null || die "cannot finish the translator"
+left=$(strings -a "$D" | grep -cF "$HOME/" || true)
+[ "$left" = 0 ] || echo "note: $left path(s) under $HOME left in the translator"
 
 echo
 echo "built into $OUT:"
