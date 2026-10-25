@@ -23,6 +23,8 @@
 | 5 | 着色器采样器数组 | Electron 应用里 xterm.js 终端（WebGL）一片空白 | 终端正常显示文字 | 开启 |
 | 6 | 零拷贝显存（unmapped VRAM） | BAR1 只有 256 MB，开机约 20 秒就耗尽，之后所有窗口走“内存中转拷贝” | 窗口 surface 直接共享显存，不再整帧拷贝 | 开启 |
 | 7 | WindowServer 读取标记 | 开零拷贝后快速滚动时标题栏闪烁 | 闪烁基本消失 | 开启 |
+| 8 | 模板导出误判 | Chrome/Edge（Skia Graphite）里的矢量图标被画成实心方块 | 图标正常显示 | 开启 |
+| 9 | Chromium 画面同步 | Chrome/Edge 移动鼠标、滚动时整个网页区域闪白一帧 | 不再闪烁 | Chromium GPU 进程默认开启 |
 
 ### 1. HiDPI 高刷新率（`hidpi-180hz` 分支，改 NVRMFB）
 
@@ -87,6 +89,25 @@ Electron 应用（如 Claude、VS Code）里的终端用 xterm.js 的 WebGL 渲�
 读取并等待，闪烁基本消失。
 
 开关：默认开启。`NVMTL_NO_READ_MARKS=1` 或 `sudo sysctl debug.nvaccel_surface_read_on=0` 可关闭。
+
+### 8. 模板导出误判（`stencil-emu-detect` 分支，改 Metal 插件）
+
+NVIDIA 显卡不支持片段着色器写模板值（stencil export），原版驱动会把这类着色器改写，并把一次绘制按每个模板位
+重画几遍、每遍换一个参考值。判断“是不是这类着色器”的方法是：着色器里有没有哪个结构体成员位于字节偏移 160。
+Chrome/Edge 的 Skia Graphite 画渐变的着色器，uniform 结构体里正好有个字段在偏移 160，于是被误判：图标的覆盖绘制
+被换成别的参考值重画，模板裁剪失效，Codex、Gemini 这类矢量图标被画成整块方框。
+
+现在只有 push constant 块、且第 0 个成员在偏移 160（也就是翻译器真正生成的那种）才算。原版驱动本身就有这个问题。
+
+### 9. Chromium 画面同步（`chromium-surface-sync` 分支，改 Metal 插件）
+
+Chrome、Edge 和 Electron 应用的 GPU 进程在命令缓冲“已调度”后，就把这一帧的 IOSurface 交给浏览器去显示，
+但这时显卡可能还没画完。WindowServer 拿到的是没画完的画面，表现为移动鼠标或滚动时整个网页区域闪白一帧。
+
+原版驱动里已经有 `NVMTL_SCHEDULE_AFTER_SURFACE_WRITES` 这个开关：写共享 surface 的命令缓冲要等显卡画完才算
+“已调度”。现在它在 Chromium GPU 进程（命令行带 `--type=gpu-process`）里默认开启，其它程序不受影响。
+
+开关：`NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=0` 全部关闭，`=1` 对所有程序开启。
 
 ## 怎么使用
 
@@ -169,6 +190,7 @@ sudo bash fork/conf.sh NVMTL_ANGLE_METAL "Claude Helper"
 | `NVMTL_SURFIN_STATS=1` | 每 2 秒在系统日志里输出上传统计 |
 | `NVMTL_ANGLE_METAL=<进程名,...>` | 给指定的 Chromium/Electron GPU 进程开启 Metal；`1` 表示全部 |
 | `NVMTL_NO_READ_MARKS=1` | 关闭读取标记（排查问题用） |
+| `NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=0` / `1` | Chromium 画面同步：`0` 全部关闭，`1` 所有程序开启（默认只在 Chromium GPU 进程开启） |
 | `NVMTL_NO_AIR_TEXENV=1` | 关闭 ANGLE 着色器内联步骤（排查问题用） |
 
 进程名要写 GPU 进程的可执行文件名，例如 Claude 是 `Claude Helper`，有的应用是 `xxx Helper (GPU)`。打开那个应用后，
@@ -218,6 +240,8 @@ sudo bash ~/nullmoth-fork-backup-<日期>/restore.sh
 | `translator-sampler-arrays` | 5. 着色器采样器数组 |
 | `zerocopy-unmapped-vram` | 6. 零拷贝显存 |
 | `ws-read-marks` | 7. WindowServer 读取标记 |
+| `stencil-emu-detect` | 8. 模板导出误判 |
+| `chromium-surface-sync` | 9. Chromium 画面同步 |
 
 ## 许可证
 
