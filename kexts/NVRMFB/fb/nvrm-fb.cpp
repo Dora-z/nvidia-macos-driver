@@ -83,12 +83,19 @@ static inline uint64_t nvrmVramBudget(uint64_t barLen)
 // scanout is not mapped yet, so the conservative policy stands until it is.
 static volatile SInt64 gVramDisplayBytes = 0;
 static int gVramDisplayAware = 1;
-static inline uint64_t nvrmSurfaceBudget(uint64_t barLen, SInt64 displayBytes)
+// With unmapped grants on, a surface past the budget still gets VRAM (only no CPU mapping), so the budget can leave
+// clients that must map VRAM for the CPU more room than RM's own 16 MB. The NVENC libraries map their buffers through
+// BAR1: on a 256 MB BAR1 with a 1080p display the surfaces left 16 MB, the encoder's 16th mapping failed with
+// NV_ERR_NO_MEMORY and hardware encoding never started (UU Remote). It came up with 29 MB free; 48 MB leaves room for a
+// second session. debug.nvrmfb_vram_margin_mb sets it (read on every grant); 16 is the old margin.
+static int gVramMarginMB = 48;
+static inline uint64_t nvrmSurfaceBudget(uint64_t barLen, SInt64 displayBytes, bool unmapped)
 {
     if (barLen >= (4ull << 30)) return barLen / 2;        // resizable BAR: half, the display is a rounding error
     if (!gVramDisplayAware || displayBytes <= 0)
         return nvrmVramBudget(barLen);                     // display not measured yet -- keep the conservative policy
-    const uint64_t margin = 16ull << 20;                   // RM's own BAR1 mappings are not tracked in gVramMappedBytes
+    const int mb = unmapped && gVramMarginMB > 16 ? (gVramMarginMB < 128 ? gVramMarginMB : 128) : 16;
+    const uint64_t margin = (uint64_t)mb << 20;            // RM's own BAR1 mappings are not tracked in gVramMappedBytes
     const uint64_t reserve = (uint64_t)displayBytes + margin;
     if (reserve >= barLen) return nvrmVramBudget(barLen);  // pathological (display fills the window) -- fall back
     return barLen - reserve;
@@ -3225,6 +3232,7 @@ SYSCTL_INT(_debug, OID_AUTO, nvrmfb_vram_display_aware, CTLFLAG_RW | CTLFLAG_LOC
 static int gVramUnmapped = 1, gVramUnmappedCapMB = 2048;
 static volatile SInt64 gVramUnmappedBytes = 0, gCntUnmappedGrant = 0, gCntUnmappedRefused = 0;
 SYSCTL_INT(_debug, OID_AUTO, nvrmfb_vram_unmapped, CTLFLAG_RW | CTLFLAG_LOCKED, &gVramUnmapped, 0, "1 = past the BAR1 budget, grant VRAM with no BAR1 mapping to callers that accept it");
+SYSCTL_INT(_debug, OID_AUTO, nvrmfb_vram_margin_mb, CTLFLAG_RW | CTLFLAG_LOCKED, &gVramMarginMB, 0, "BAR1 left out of the surface budget for CPU mappings (NVENC), MB; 16-128, used while unmapped grants are on");
 SYSCTL_INT(_debug, OID_AUTO, nvrmfb_vram_unmapped_cap_mb, CTLFLAG_RW | CTLFLAG_LOCKED, &gVramUnmappedCapMB, 0, "most VRAM held by unmapped grants at once, MB");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_unmapped_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gVramUnmappedBytes, "VRAM held by unmapped grants, live");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_unmapped_grants, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntUnmappedGrant, "unmapped grants made");
@@ -3288,7 +3296,7 @@ static void nvrmfbInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvrmfb_vram_display_bytes); sysctl_register_oid(&sysctl__debug_nvrmfb_vram_display_aware);
     sysctl_register_oid(&sysctl__debug_nvrmfb_vram_unmapped); sysctl_register_oid(&sysctl__debug_nvrmfb_vram_unmapped_cap_mb);
     sysctl_register_oid(&sysctl__debug_nvrmfb_vram_unmapped_bytes); sysctl_register_oid(&sysctl__debug_nvrmfb_vram_unmapped_grants);
-    sysctl_register_oid(&sysctl__debug_nvrmfb_vram_unmapped_refused);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_vram_unmapped_refused); sysctl_register_oid(&sysctl__debug_nvrmfb_vram_margin_mb);
     sysctl_register_oid(&sysctl__debug_nvrmfb_vramtest); sysctl_register_oid(&sysctl__debug_nvrmfb_vramtest_mode);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_interval); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_us_sum);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_n); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_us_max);
@@ -3309,7 +3317,7 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
     NvU64 want = (r->size + 0xFFFFull) & ~0xFFFFull;
     if (!want) return false;
 
-    const SInt64 budget = (SInt64)nvrmSurfaceBudget(fBarLen, gVramDisplayBytes);
+    const SInt64 budget = (SInt64)nvrmSurfaceBudget(fBarLen, gVramDisplayBytes, gVramUnmapped && unmappedOk);
     gVramBudgetBytes = budget;
     // Parked blocks keep their BAR1 mapping (see below), so they count against the budget. On a 256 MB BAR1 (every
     // GTX 16, boards without Resizable BAR) the park ceiling is the smaller one, so surfaces keep most of the budget.
