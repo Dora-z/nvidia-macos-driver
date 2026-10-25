@@ -3,6 +3,7 @@
  * Copyright (c) 2026 NullMoth Systems.
  * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  */
+#include <crt_externs.h>
 
 @interface NVMTLQueueReservation : NSObject { @public __weak NVMTLCommandBuffer *buffer; } @end
 @implementation NVMTLQueueReservation @end
@@ -398,7 +399,15 @@ static int nvmtl_skip_empty_on(void) {
     memset(&_c, 0, sizeof(_c));
     part->resources = [(NVMTLResSet *)_resources nvmtlTakeAll]; part->surfaces = [_surfDirty copy];
     // Another process may read an IOSurface once its writer is scheduled, and nothing orders its queue after ours.
-    static int after = -1; if (after < 0) { const char *e = getenv("NVMTL_SCHEDULE_AFTER_SURFACE_WRITES"); after = e && e[0] == '1'; }
+    // On by default in a Chromium GPU process (Chrome, Edge, Electron apps: --type=gpu-process). Its compositor frames
+    // are IOSurfaces handed to the browser once the command buffer is scheduled, and WindowServer showed them before the
+    // GPU had drawn them: the whole page flashed blank for a frame while the mouse moved (Edge, Skia Graphite).
+    // NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=1 turns it on everywhere, =0 off everywhere.
+    static int after = -1; if (after < 0) { const char *e = getenv("NVMTL_SCHEDULE_AFTER_SURFACE_WRITES");
+        if (e && (e[0] == '0' || e[0] == '1')) after = e[0] == '1';
+        else { after = 0; char **av = *_NSGetArgv(); for (int i = 1, n = *_NSGetArgc(); i < n && !after; i++) after = av[i] && !strcmp(av[i], "--type=gpu-process"); }
+        if (after) nvlog("commit: a command buffer writing a shared surface is scheduled only when the GPU has finished it (%s)",
+                         e ? "NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=1" : "Chromium GPU process"); }
     NVMTLTexture *drawable = _present ? (_present->_parent ?: _present) : nil;
     for (NVMTLTexture *s in part->surfaces) if (after && s != drawable) _scheduleAfterPublish = YES;
     part->scratch = [_scratch copy]; part->signalEvent = event; part->value = value;
