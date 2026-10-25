@@ -25,6 +25,7 @@
 | 7 | WindowServer 读取标记 | 开零拷贝后快速滚动时标题栏闪烁 | 闪烁基本消失 | 开启 |
 | 8 | 模板导出误判 | Chrome/Edge（Skia Graphite）里的矢量图标被画成实心方块 | 图标正常显示 | 开启 |
 | 9 | Chromium 画面同步 | Chrome/Edge 移动鼠标、滚动时整个网页区域闪白一帧 | 不再闪烁 | Chromium GPU 进程默认开启 |
+| 10 | 硬件编码关键帧标记 | UU 远程等应用认不出 NVENC 输出的关键帧，一直停在“传输画面” | 关键帧按 Apple 的方式标记 | 开启 |
 
 ### 1. HiDPI 高刷新率（`hidpi-180hz` 分支，改 NVRMFB）
 
@@ -108,6 +109,18 @@ Chrome、Edge 和 Electron 应用的 GPU 进程在命令缓冲“已调度”后
 “已调度”。现在它在 Chromium GPU 进程（命令行带 `--type=gpu-process`）里默认开启，其它程序不受影响。
 
 开关：`NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=0` 全部关闭，`=1` 对所有程序开启。
+
+### 10. 硬件编码关键帧标记（`nvenc-keyframe-attachment` 分支，改 Metal 插件）
+
+来自上游 issue [#388](https://github.com/nullmoth/nvidia-macos-driver/issues/388)（也见 #358）。驱动自带的 NVENC 编码库
+（H.264 / HEVC，各代显卡共 6 个，都是预编译二进制）在关键帧上写 `kCMSampleAttachmentKey_NotSync = false`；Apple 自己的
+编码器在关键帧上是**不写**这个键。UU 远程按“没有 NotSync 键”来判断关键帧，于是一个关键帧都认不出，一直卡在“传输画面”。
+
+issue 里的做法是直接改编码库二进制。这里改在开源的 Metal 插件里：插件加载编码库后，只把**该库自己**调用
+`VTEncoderSessionEmitEncodedFrame` 的那个指针换成一个包装函数，包装函数把 `NotSync = false` 删掉再交给 VideoToolbox。
+非关键帧仍是 `NotSync = true`，编码数据完全不变，编码库文件本身不改。
+
+开关：默认开启。`NVMTL_NVENC_NOTSYNC_KEEP=1` 保持编码库原来的写法。
 
 ## 怎么使用
 
@@ -242,6 +255,7 @@ sudo bash ~/nullmoth-fork-backup-<日期>/restore.sh
 | `ws-read-marks` | 7. WindowServer 读取标记 |
 | `stencil-emu-detect` | 8. 模板导出误判 |
 | `chromium-surface-sync` | 9. Chromium 画面同步 |
+| `nvenc-keyframe-attachment` | 10. 硬件编码关键帧标记 |
 
 ## 许可证
 
