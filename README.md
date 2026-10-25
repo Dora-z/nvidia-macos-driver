@@ -26,6 +26,7 @@
 | 8 | 模板导出误判 | Chrome/Edge（Skia Graphite）里的矢量图标被画成实心方块 | 图标正常显示 | 开启 |
 | 9 | Chromium 画面同步 | Chrome/Edge 移动鼠标、滚动时整个网页区域闪白一帧 | 不再闪烁 | Chromium GPU 进程默认开启 |
 | 10 | 硬件编码关键帧标记 | UU 远程等应用认不出 NVENC 输出的关键帧，一直停在“传输画面” | 关键帧按 Apple 的方式标记 | 开启 |
+| 11 | BAR1 留给硬件编码 | 256 MB BAR1 被窗口 surface 占满，NVENC 编码器启动失败（`NV_ERR_NO_MEMORY`） | 硬件编码能正常启动 | 开启 |
 
 ### 1. HiDPI 高刷新率（`hidpi-180hz` 分支，改 NVRMFB）
 
@@ -121,6 +122,19 @@ issue 里的做法是直接改编码库二进制。这里改在开源的 Metal �
 非关键帧仍是 `NotSync = true`，编码数据完全不变，编码库文件本身不改。
 
 开关：默认开启。`NVMTL_NVENC_NOTSYNC_KEEP=1` 保持编码库原来的写法。
+
+### 11. BAR1 留给硬件编码（`bar1-headroom` 分支，改 NVRMFB）
+
+BAR1 是 CPU 访问显存的窗口，GTX 16 系最大只有 256 MB（显卡本身的限制，开 Above 4G / Re-Size BAR 也不会变大）。
+原版驱动给窗口 surface 的映射预算是“BAR1 − 显示器占用 − 16 MB”，1080p 下窗口 surface 会把预算用满，只给其它
+需要 CPU 映射显存的程序留 16 MB。NVENC 编码库启动时要映射十几块缓冲，第 16 块就报 `NV_ERR_NO_MEMORY`，
+硬件编码根本起不来（UU 远程等用不了硬件编码）。
+
+有了第 6 项的零拷贝，超出预算的 surface 仍然放在显存里、只是不建 CPU 映射，所以把余量调大几乎没有代价。
+现在默认留 48 MB；实测空出约 29 MB 时编码器就能正常启动。
+
+开关：`sudo sysctl debug.nvrmfb_vram_margin_mb=<16-128>`，即时生效（对之后的分配），重启恢复默认；`16` 是原来的余量。
+只在零拷贝（`debug.nvrmfb_vram_unmapped=1`，默认）开启时生效。
 
 ## 怎么使用
 
@@ -256,6 +270,7 @@ sudo bash ~/nullmoth-fork-backup-<日期>/restore.sh
 | `stencil-emu-detect` | 8. 模板导出误判 |
 | `chromium-surface-sync` | 9. Chromium 画面同步 |
 | `nvenc-keyframe-attachment` | 10. 硬件编码关键帧标记 |
+| `bar1-headroom` | 11. BAR1 留给硬件编码 |
 
 ## 许可证
 
