@@ -182,6 +182,7 @@ static bool nvmtl_accel_armed(void)
 }
 #include <dlfcn.h>
 #include <libgen.h>
+#include <mach-o/loader.h>
 // The video libraries tile and untile frames in the Blackwell (GB20x) layout. Earlier GPUs' NVDEC/NVENC use the classic
 // one: on an RTX 3070 Laptop (issue #65, measured against Apple's software codecs) H.264 decode showed shifted macroblock
 // rows and a green stripe, and both encoders produced torn pictures. The decoder's only difference is its untiling mode
@@ -302,6 +303,70 @@ static void nvmtl_nvdec_register(void)
               st ? "NOT registered" : "REGISTERED", me, (int)st, path);
     });
 }
+// Keyframe marking for apps that test the key's presence (#388, #358). The encoder libraries mark an IDR frame with
+// kCMSampleAttachmentKey_NotSync = false; Apple's encoders leave the key out on a sync frame, and a client that reads
+// "no NotSync key" as "keyframe" (UU Remote's streamer) found no keyframe at all and never showed the picture. The
+// libraries are prebuilt, so the call each one makes to VTEncoderSessionEmitEncodedFrame is pointed, in that library
+// only, at a wrapper that removes NotSync = false before passing the frame on. Non-sync frames keep NotSync = true and
+// the encoded data is unchanged. NVMTL_NVENC_NOTSYNC_KEEP=1 leaves the attachments as the library wrote them.
+typedef int32_t (*nvmtl_vt_emit_fn)(void *session, void *token, int32_t status, uint32_t flags, const void *sb);
+static nvmtl_vt_emit_fn g_vt_emit;
+static int32_t nvmtl_vt_emit_sync_fixed(void *session, void *token, int32_t status, uint32_t flags, const void *sb)
+{
+    typedef CFArrayRef (*AttFn)(const void *, Boolean);
+    static AttFn att; static CFStringRef notSync;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        att = (AttFn)dlsym(RTLD_DEFAULT, "CMSampleBufferGetSampleAttachmentsArray");
+        CFStringRef *k = (CFStringRef *)dlsym(RTLD_DEFAULT, "kCMSampleAttachmentKey_NotSync");
+        notSync = k ? *k : NULL;
+    });
+    if (sb && att && notSync) {
+        CFArrayRef a = att(sb, false);
+        for (CFIndex i = 0, n = a ? CFArrayGetCount(a) : 0; i < n; i++) {
+            CFMutableDictionaryRef d = (CFMutableDictionaryRef)CFArrayGetValueAtIndex(a, i);
+            if (d && CFDictionaryGetValue(d, notSync) == kCFBooleanFalse) CFDictionaryRemoveValue(d, notSync);
+        }
+    }
+    return g_vt_emit(session, token, status, flags, sb);
+}
+// Rewrites the library's own pointer to VTEncoderSessionEmitEncodedFrame (its __got / symbol-pointer sections); every
+// other image keeps calling VideoToolbox directly.
+static void nvmtl_nvenc_fix_sync_marks(void *factory, const char *path)
+{
+    const char *keep = getenv("NVMTL_NVENC_NOTSYNC_KEEP");
+    if (keep && keep[0] == '1') { nvlog("nvenc: NVMTL_NVENC_NOTSYNC_KEEP=1 - keyframes keep NotSync=false (%s)", path); return; }
+    void *real = dlsym(RTLD_DEFAULT, "VTEncoderSessionEmitEncodedFrame");
+    Dl_info di;
+    if (!real || !dladdr(factory, &di) || !di.dli_fbase) { nvlog("nvenc: keyframe marks NOT fixed - emit or image not found (%s)", path); return; }
+    if (!g_vt_emit) g_vt_emit = (nvmtl_vt_emit_fn)real;
+    const struct mach_header_64 *mh = (const struct mach_header_64 *)di.dli_fbase;
+    if (mh->magic != MH_MAGIC_64) return;
+    intptr_t slide = 0; const struct load_command *lc = (const struct load_command *)(mh + 1);
+    for (uint32_t i = 0; i < mh->ncmds; i++, lc = (const struct load_command *)((const char *)lc + lc->cmdsize))
+        if (lc->cmd == LC_SEGMENT_64 && !strcmp(((const struct segment_command_64 *)lc)->segname, "__TEXT"))
+            slide = (intptr_t)mh - (intptr_t)((const struct segment_command_64 *)lc)->vmaddr;
+    unsigned fixed = 0; lc = (const struct load_command *)(mh + 1);
+    for (uint32_t i = 0; i < mh->ncmds; i++, lc = (const struct load_command *)((const char *)lc + lc->cmdsize)) {
+        if (lc->cmd != LC_SEGMENT_64) continue;
+        const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+        const struct section_64 *sec = (const struct section_64 *)(seg + 1);
+        for (uint32_t j = 0; j < seg->nsects; j++, sec++) {
+            const uint32_t type = sec->flags & SECTION_TYPE;
+            if (type != S_NON_LAZY_SYMBOL_POINTERS && type != S_LAZY_SYMBOL_POINTERS) continue;
+            void **ptr = (void **)(sec->addr + slide);
+            for (uint64_t k = 0; k < sec->size / sizeof(void *); k++) {
+                if (ptr[k] != real) continue;
+                vm_address_t page = (vm_address_t)&ptr[k] & ~(vm_address_t)(vm_page_size - 1);
+                if (vm_protect(mach_task_self(), page, vm_page_size, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) continue;
+                ptr[k] = (void *)nvmtl_vt_emit_sync_fixed; fixed++;
+                vm_protect(mach_task_self(), page, vm_page_size, false, VM_PROT_READ);
+            }
+        }
+    }
+    nvlog("nvenc: keyframe marks %s in %s (%u pointer%s)", fixed ? "fixed - sync frames carry no NotSync key" : "NOT fixed - no emit pointer found",
+          path, fixed, fixed == 1 ? "" : "s");
+}
 static void nvmtl_nvenc_register(void)
 {
     static dispatch_once_t once;
@@ -323,6 +388,7 @@ static void nvmtl_nvenc_register(void)
         if (!h) { nvlog("nvenc: dlopen %s FAILED: %s", path, dlerror()); return; }
         void *fac = dlsym(h, "NVEncH264_CreateInstance");
         if (!fac) { nvlog("nvenc: %s has no NVEncH264_CreateInstance", path); return; }
+        nvmtl_nvenc_fix_sync_marks(fac, path);
         NSDictionary *info = @{ @"CMClassImplementationID": @"com.nvmtl.videoencoder.avc.nvenc",
                                 @"CMClassImplementationName": @"NVIDIA NVENC H.264",
                                 @"VTRating": @1000, @"VTIsHardwareAccelerated": @YES };
@@ -478,6 +544,7 @@ static void nvmtl_nvenc_hevc_register(void)
         if (!h) { nvlog("nvenc: dlopen %s FAILED: %s", path, dlerror()); return; }
         void *fac = dlsym(h, "NVEncHEVC_CreateInstance");
         if (!fac) { nvlog("nvenc: %s has no NVEncHEVC_CreateInstance", path); return; }
+        nvmtl_nvenc_fix_sync_marks(fac, path);
         NSDictionary *info = @{ @"CMClassImplementationID": @"com.nvmtl.videoencoder.hevc.nvenc",
                                 @"CMClassImplementationName": @"NVIDIA NVENC HEVC",
                                 @"VTRating": @1000, @"VTIsHardwareAccelerated": @YES };
