@@ -3174,15 +3174,22 @@ static int nvmtl_fbfetch_on(void)
     return on;
 }
 #define NVMTL_STENCIL_EMU_OFFSET 160u   /* the translator's native::stencil_export::STENCIL_EXPORT_PUSH_OFFSET */
-/* the translator's stencil-export lowering: a push-constant block member at offset 160 (stencil emulation, see NVMTL_SEMU_DRAW) */
+/* the translator's stencil-export lowering: a push-constant block whose member 0 sits at offset 160 (stencil emulation,
+ * see NVMTL_SEMU_DRAW). Only a PushConstant pointee counts: an ordinary uniform or storage struct with a field at byte
+ * 160 (Chrome's Graphite gradient shaders) is not an export, and replaying such a draw once per stencil bit with that bit
+ * as the reference ignored its stencil test - every Codex/Gemini-style path icon was covered as its whole bounding box. */
 uint32_t nvmtl_spirv_stencil_emu(const void *code, size_t bytes)
 {
     const uint32_t *w = (const uint32_t *)code; const size_t nw = bytes / 4;
     if (nw < 5 || w[0] != 0x07230203u) return 0;
+    uint32_t cand[8]; unsigned nc = 0;
     for (size_t i = 5; i < nw; ) {
         uint32_t wc = w[i] >> 16, op = w[i] & 0xffffu;
         if (!wc || i + wc > nw) break;
-        if (op == 72 && wc == 5 && w[i + 3] == 35 && w[i + 4] == 160u) return 1;   // OpMemberDecorate .. Offset 160
+        if (op == 72 && wc == 5 && w[i + 2] == 0 && w[i + 3] == 35 && w[i + 4] == NVMTL_STENCIL_EMU_OFFSET && nc < 8)
+            cand[nc++] = w[i + 1];                                                   // OpMemberDecorate %s 0 Offset 160
+        else if (op == 32 && wc == 4 && w[i + 2] == 9)                               // OpTypePointer %p PushConstant %s
+            for (unsigned k = 0; k < nc; k++) if (cand[k] == w[i + 3]) return 1;
         i += wc;
     }
     return 0;
