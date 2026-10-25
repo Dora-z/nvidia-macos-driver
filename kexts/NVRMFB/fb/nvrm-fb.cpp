@@ -86,9 +86,11 @@ static int gVramDisplayAware = 1;
 // With unmapped grants on, a surface past the budget still gets VRAM (only no CPU mapping), so the budget can leave
 // clients that must map VRAM for the CPU more room than RM's own 16 MB. The NVENC libraries map their buffers through
 // BAR1: on a 256 MB BAR1 with a 1080p display the surfaces left 16 MB, the encoder's 16th mapping failed with
-// NV_ERR_NO_MEMORY and hardware encoding never started (UU Remote). It came up with 29 MB free; 48 MB leaves room for a
-// second session. debug.nvrmfb_vram_margin_mb sets it (read on every grant); 16 is the old margin.
-static int gVramMarginMB = 48;
+// NV_ERR_NO_MEMORY and hardware encoding never started (UU Remote). A 1080p session maps about 34 MB; one at a HiDPI
+// backing size (3168x1782) maps about 53 MB including one 44 MB block, and UU's stream at that size only came up with
+// 96 MB left (BAR1 fragments, so the largest free block is what counts). debug.nvrmfb_vram_margin_mb sets it (read on
+// every grant); 16 is the old margin.
+static int gVramMarginMB = 96;
 static inline uint64_t nvrmSurfaceBudget(uint64_t barLen, SInt64 displayBytes, bool unmapped)
 {
     if (barLen >= (4ull << 30)) return barLen / 2;        // resizable BAR: half, the display is a rounding error
