@@ -408,8 +408,17 @@ static int nvmtl_skip_empty_on(void) {
         else { after = 0; char **av = *_NSGetArgv(); for (int i = 1, n = *_NSGetArgc(); i < n && !after; i++) after = av[i] && !strcmp(av[i], "--type=gpu-process"); }
         if (after) nvlog("commit: a command buffer writing a shared surface is scheduled only when the GPU has finished it (%s)",
                          e ? "NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=1" : "Chromium GPU process"); }
+    // A multi-plane (YUV) surface is a video frame handed to another process, and is held the same way in every process
+    // unless NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=0. Screen capture (CGDisplayStream, ScreenCaptureKit) has WindowServer
+    // render each frame into a 420v surface and hand it over once scheduled; the client's encoder locks it and reads both
+    // planes on the CPU at once. Published only after the GPU finished, the CbCr plane written last was often the old
+    // one: in UU Remote's stream every moving thing (the Dock magnifying) showed its colours trailing its shape.
+    static int yuv = -1; if (yuv < 0) { const char *e = getenv("NVMTL_SCHEDULE_AFTER_SURFACE_WRITES"); yuv = !(e && e[0] == '0'); }
     NVMTLTexture *drawable = _present ? (_present->_parent ?: _present) : nil;
-    for (NVMTLTexture *s in part->surfaces) if (after && s != drawable) _scheduleAfterPublish = YES;
+    for (NVMTLTexture *s in part->surfaces) {
+        if (s == drawable) continue;
+        if (after || (yuv && s->_surf && IOSurfaceGetPlaneCount(s->_surf) > 1)) _scheduleAfterPublish = YES;
+    }
     part->scratch = [_scratch copy]; part->signalEvent = event; part->value = value;
     part->encoders = _nEnc - _nEncSealed; _nEncSealed = _nEnc;
     if (_g79Sig.count) { part->signals = [_g79Sig copy]; [_g79Sig removeAllObjects]; }
