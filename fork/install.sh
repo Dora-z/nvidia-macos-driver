@@ -1,6 +1,6 @@
 #!/bin/bash
 # sudo bash fork/install.sh [build-dir]: put this fork's NVAccel, NVRMFB, Metal plugin and shader translator over an
-# installed NullMoth 2.5.3 or 2.5.4 (installed with the 1401 app). Everything else of the driver stays as it is.
+# installed NullMoth 2.5.3 to 2.6.x (installed with the 1401 app). Everything else of the driver stays as it is.
 #   1. test-builds the Auxiliary Kernel Collection with the two kexts (nothing changes if that fails)
 #   2. backs up what it replaces to ~/nullmoth-fork-backup-<date> (with a restore.sh)
 #   3. installs, publishes the new kernel collection; restart afterwards
@@ -21,9 +21,9 @@ for f in NVAccel.kext/Contents/MacOS/NVAccel NVRMFB.kext/Contents/MacOS/NVRMFB N
   [ -f "$IN/$f" ] || die "$IN/$f missing: run fork/build.sh first, or use a release download"
 done
 codesign -v "$IN/NVMTLDriver" 2>/dev/null && codesign -v "$IN/libnvmtl_translate.dylib" 2>/dev/null || die "plugin or translator not signed"
-for k in $KEXTS; do [ -d "$EXT/$k.kext" ] || die "$k.kext missing: install NullMoth 2.5.3 or 2.5.4 with 1401 first"; done
+for k in $KEXTS; do [ -d "$EXT/$k.kext" ] || die "$k.kext missing: install NullMoth 2.5.3 to 2.6.x with 1401 first"; done
 ver=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$EXT/NVRM.kext/Contents/Info.plist" 2>/dev/null)
-case "$ver" in 2.5.3|2.5.4) ;; *) die "installed NullMoth is '$ver'; this fork needs 2.5.3 or 2.5.4";; esac
+case "$ver" in 2.5.3|2.5.4|2.5.5|2.6.*) ;; *) die "installed NullMoth is '$ver'; this fork needs 2.5.3 to 2.6.x";; esac
 [ -f "$GB/NVMTLDriver" ] && [ -f "$GB/libnvmtl_translate.dylib" ] || die "the NullMoth Metal plugin is not installed"
 
 echo "1. test kernel collection with the fork's NVAccel and NVRMFB (nothing installed yet)"

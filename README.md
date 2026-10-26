@@ -1,6 +1,6 @@
 # NullMoth NVIDIA 驱动 · 个人优化版
 
-这是 [nullmoth/nvidia-macos-driver](https://github.com/nullmoth/nvidia-macos-driver) 的个人 fork，基于官方 **v2.5.4**，
+这是 [nullmoth/nvidia-macos-driver](https://github.com/nullmoth/nvidia-macos-driver) 的个人 fork，基于官方 **v2.6.2**，
 主要针对 Turing 显卡（GTX 16 系）上的高刷新率、窗口合成性能和 Chromium/Electron 应用的 GPU 渲染做了修复和优化。
 
 > [!WARNING]
@@ -121,6 +121,9 @@ issue 里的做法是直接改编码库二进制。这里改在开源的 Metal �
 `VTEncoderSessionEmitEncodedFrame` 的那个指针换成一个包装函数，包装函数把 `NotSync = false` 删掉再交给 VideoToolbox。
 非关键帧仍是 `NotSync = true`，编码数据完全不变，编码库文件本身不改。
 
+上游 2.5.5 也修了这个问题，修在随 1401 安装的新编码库里。装了 2.5.5 及以后的官方版本，编码库本身就不再写
+`NotSync = false`，这里的包装函数没有东西可删，等于不起作用；用旧编码库时仍然有效。两者同时存在不冲突。
+
 开关：默认开启。`NVMTL_NVENC_NOTSYNC_KEEP=1` 保持编码库原来的写法。
 
 ### 11. BAR1 留给硬件编码（`bar1-headroom` 分支，改 NVRMFB）
@@ -140,7 +143,7 @@ BAR1 是 CPU 访问显存的窗口，GTX 16 系最大只有 256 MB（显卡本�
 
 ### 前提
 
-- 已经用 [1401](https://github.com/nullmoth/1401) 装好官方 **NullMoth 2.5.3 或 2.5.4**，并且能正常进入桌面；
+- 已经用 [1401](https://github.com/nullmoth/1401) 装好官方 **NullMoth 2.5.3 到 2.6.x**（推荐 2.6.2），并且能正常进入桌面；
 - macOS 15 Sequoia，Intel / x86_64（macOS 26 未构建、未测试，安装脚本会拒绝）。
 
 ### 1. 安装
@@ -256,7 +259,7 @@ sudo bash ~/nullmoth-fork-backup-<日期>/restore.sh
 
 ## 分支
 
-每项改动是基于 `v2.5.4` 的独立分支，`main` 合并了全部分支，另加 `fork/` 下的脚本和本说明。
+每项改动是基于 `v2.5.4` 的独立分支，`main` 合并了全部分支和上游 `v2.6.2`，另加 `fork/` 下的脚本和本说明。
 
 | 分支 | 内容 |
 | --- | --- |
