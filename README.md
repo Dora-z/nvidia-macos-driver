@@ -27,6 +27,7 @@
 | 9 | Chromium 画面同步 | Chrome/Edge 移动鼠标、滚动时整个网页区域闪白一帧 | 不再闪烁 | Chromium GPU 进程默认开启 |
 | 10 | 硬件编码关键帧标记 | UU 远程等应用认不出 NVENC 输出的关键帧，一直停在“传输画面” | 关键帧按 Apple 的方式标记 | 开启 |
 | 11 | BAR1 留给硬件编码 | 256 MB BAR1 被窗口 surface 占满，NVENC 编码器启动失败（`NV_ERR_NO_MEMORY`） | 硬件编码能正常启动 | 开启 |
+| 12 | 远程画面颜色同步 | UU 远程等抓屏画面里，移动的东西颜色拖在形状后面（程序坞放大时重影） | 不再重影 | 开启 |
 
 ### 1. HiDPI 高刷新率（`hidpi-180hz` 分支，改 NVRMFB）
 
@@ -138,6 +139,17 @@ BAR1 是 CPU 访问显存的窗口，GTX 16 系最大只有 256 MB（显卡本�
 
 开关：`sudo sysctl debug.nvrmfb_vram_margin_mb=<16-128>`，即时生效（对之后的分配），重启恢复默认；`16` 是原来的余量。调大后窗口 surface 能用的 BAR1 映射变少，超出部分走零拷贝。
 只在零拷贝（`debug.nvrmfb_vram_unmapped=1`，默认）开启时生效。
+
+### 12. 远程画面颜色同步（`yuv-surface-sync` 分支，改 Metal 插件）
+
+UU 远程这类软件抓屏时，WindowServer 用显卡把每一帧画进一个两层的视频画面（420v：亮度一层、色彩一层），
+命令“已安排”就把这一帧交给抓屏的程序，编码器马上用 CPU 把两层一起读走。而驱动要等显卡真正画完之后（约 2～10 ms）
+才把新数据交给别的进程，所以编码器常读到“新的亮度 + 上一帧的色彩”：远程画面里，程序坞放大时图标的颜色拖在形状后面。
+
+现在任何进程写多层（YUV）画面的命令缓冲，要等写入的数据真正交出去以后才算“已安排”。单层画面（包括 WindowServer
+平时合成桌面用的）不受影响。本地模拟“一个进程写、另一个进程立刻读”：300 帧里读到旧数据从 300 帧降到 0 帧；UU 远程实测不再重影。
+
+开关：默认开启。`NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=0` 会同时关掉这一项和第 9 项。
 
 ## 怎么使用
 
@@ -274,6 +286,7 @@ sudo bash ~/nullmoth-fork-backup-<日期>/restore.sh
 | `chromium-surface-sync` | 9. Chromium 画面同步 |
 | `nvenc-keyframe-attachment` | 10. 硬件编码关键帧标记 |
 | `bar1-headroom` | 11. BAR1 留给硬件编码 |
+| `yuv-surface-sync` | 12. 远程画面颜色同步 |
 
 ## 许可证
 
